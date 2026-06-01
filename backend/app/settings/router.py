@@ -29,22 +29,36 @@ def update_settings(payload: SettingsWrite, db: Session = Depends(get_db)):
     return set_settings(db, payload.model_dump(exclude_unset=True))
 
 
-@router.post("/verify-smtp")
-async def verify_smtp(db: Session = Depends(get_db)):
+async def _verify_email_provider(db: Session):
     user = get_value(db, "gmail_user")
     password = get_secret(db, "gmail_app_password")
-    adapter = GmailAdapter()
+    adapter = GmailAdapter.from_settings(db)
+    transport = get_value(db, "email_transport", "smtp")
     try:
         readiness = await adapter.verify(user, password)
     except Exception as exc:
         readiness = "failed"
-        emit_event(db, "sender.smtp_failed", payload={"error_detail": redacted_error(exc)})
-    if readiness == "smtp_verified":
-        set_value(db, "sender_readiness", "smtp_verified")
-        emit_event(db, "sender.smtp_verified", payload={"gmail_user": user})
+        emit_event(db, "sender.smtp_failed", payload={"transport": transport, "error_detail": redacted_error(exc)})
+    if readiness in {"smtp_verified", "provider_verified"}:
+        set_value(db, "sender_readiness", readiness)
+        emit_event(db, "sender.smtp_verified", payload={"gmail_user": user, "transport": transport})
         db.commit()
         return {"readiness": readiness}
     set_value(db, "sender_readiness", "failed")
-    emit_event(db, "sender.smtp_failed", payload={"error_detail": "SMTP verification failed"})
+    emit_event(db, "sender.smtp_failed", payload={"transport": transport, "error_detail": "Email provider verification failed"})
     db.commit()
-    return {"readiness": "failed", "error_code": "smtp_auth_failed", "error_detail": "SMTP verification failed"}
+    return {
+        "readiness": "failed",
+        "error_code": "email_provider_verification_failed",
+        "error_detail": "Email provider verification failed",
+    }
+
+
+@router.post("/verify-email")
+async def verify_email(db: Session = Depends(get_db)):
+    return await _verify_email_provider(db)
+
+
+@router.post("/verify-smtp")
+async def verify_smtp(db: Session = Depends(get_db)):
+    return await _verify_email_provider(db)

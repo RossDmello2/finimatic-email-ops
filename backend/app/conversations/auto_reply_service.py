@@ -24,7 +24,7 @@ from app.core.idempotency import sha256_key
 from app.core.time import iso, utcnow
 from app.db.models import Contact, ConversationMessage, Draft, Reply, SendAttempt, Suppression
 from app.send.smtp_adapter import GmailAdapter
-from app.settings.service import get_bool, get_int, get_secret, get_value
+from app.settings.service import get_bool, get_int, get_secret, get_value, sender_credentials_configured
 
 
 SAFE_DEFAULT_INTENTS = {"positive_interest", "objection", "question"}
@@ -428,7 +428,7 @@ class AutoReplyService:
             reasons.append("CANARY_NOT_VERIFIED")
         if get_bool(db, "dry_run"):
             reasons.append("DRY_RUN_ENABLED")
-        if not get_value(db, "gmail_user") or not get_secret(db, "gmail_app_password"):
+        if not sender_credentials_configured(db):
             reasons.append("SENDER_NOT_CONFIGURED")
         if allow_proposed and "RECIPIENT_REPLIED" in reasons:
             reasons.remove("RECIPIENT_REPLIED")
@@ -476,7 +476,7 @@ class AutoReplyService:
         if existing:
             return AutoReplyResult(action="skipped", mode="autonomous", reason="duplicate", message_id=existing.provider_msg_id, subject=draft.subject)
         sent_at = utcnow()
-        result = await GmailAdapter().send_message(contact.email, draft.subject, draft.body, user, password)
+        result = await GmailAdapter.from_settings(db).send_message(contact.email, draft.subject, draft.body, user, password)
         if result.status != "success":
             db.add(
                 SendAttempt(

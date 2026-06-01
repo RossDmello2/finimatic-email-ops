@@ -28,7 +28,7 @@ async def send_canary(db: Session = Depends(get_db)):
         db.commit()
         return {"status": "duplicate_blocked", "previous_attempt_id": existing.id}
 
-    result = await GmailAdapter().canary_send(user, password, report_recipient, idempotency_key)
+    result = await GmailAdapter.from_settings(db).canary_send(user, password, report_recipient, idempotency_key)
     if result.status != "success":
         db.add(
             SendAttempt(

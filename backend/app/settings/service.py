@@ -15,6 +15,10 @@ from app.db.models import Setting
 DEFAULT_SETTINGS: dict[str, str] = {
     "gmail_user": "",
     "gmail_app_password": "",
+    "email_transport": "smtp",
+    "gmail_api_client_id": "",
+    "gmail_api_client_secret": "",
+    "gmail_api_refresh_token": "",
     "groq_keys": "[]",
     "gemini_keys": "[]",
     "daily_send_cap": "50",
@@ -56,7 +60,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "sender_readiness": "not_configured",
 }
 
-SECRET_KEYS = {"gmail_app_password", "groq_keys", "gemini_keys"}
+SECRET_KEYS = {"gmail_app_password", "gmail_api_client_id", "gmail_api_client_secret", "gmail_api_refresh_token", "groq_keys", "gemini_keys"}
 
 
 def seed_settings(db: Session) -> None:
@@ -138,9 +142,10 @@ def set_settings(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
     changed_keys: list[str] = []
     warm_up_was_enabled = get_bool(db, "warm_up_mode")
 
-    if "gmail_app_password" in payload and payload["gmail_app_password"] is not None:
-        set_value(db, "gmail_app_password", encrypt_secret(str(payload["gmail_app_password"])))
-        changed_keys.append("gmail_app_password")
+    for secret_key in ("gmail_app_password", "gmail_api_client_id", "gmail_api_client_secret", "gmail_api_refresh_token"):
+        if secret_key in payload and payload[secret_key] is not None:
+            set_value(db, secret_key, encrypt_secret(str(payload[secret_key])))
+            changed_keys.append(secret_key)
 
     for key_name in ("groq_keys", "gemini_keys"):
         if key_name in payload and payload[key_name] is not None:
@@ -159,6 +164,8 @@ def set_settings(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
                 stored = str(value)
             if key == "gemini_model":
                 stored = "gemini-2.5-flash"
+            if key == "email_transport" and stored not in {"smtp", "gmail_api"}:
+                stored = DEFAULT_SETTINGS["email_transport"]
             if key == "auto_reply_mode" and stored not in {"propose", "autonomous"}:
                 stored = DEFAULT_SETTINGS["auto_reply_mode"]
             set_value(db, key, stored)
@@ -172,7 +179,7 @@ def set_settings(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
 
     if get_bool(db, "canary_verified"):
         set_value(db, "sender_readiness", "canary_verified")
-    elif get_value(db, "gmail_user") and get_value(db, "gmail_app_password"):
+    elif sender_credentials_configured(db):
         current = get_value(db, "sender_readiness", "not_configured")
         if current == "not_configured":
             set_value(db, "sender_readiness", "configured")
@@ -188,7 +195,12 @@ def settings_read(db: Session) -> dict[str, Any]:
     gemini = get_key_list(db, "gemini_keys")
     return {
         "gmail_user": get_value(db, "gmail_user"),
+        "email_transport": get_value(db, "email_transport", DEFAULT_SETTINGS["email_transport"]),
         "gmail_app_password_configured": bool(get_value(db, "gmail_app_password")),
+        "gmail_api_configured": all(
+            bool(get_value(db, key))
+            for key in ("gmail_api_client_id", "gmail_api_client_secret", "gmail_api_refresh_token")
+        ),
         "report_recipient": get_value(db, "report_recipient"),
         "groq_keys_count": len(groq),
         "groq_keys_fingerprints": fingerprints(groq),
@@ -235,3 +247,14 @@ def mode_label(db: Session) -> str:
     if not get_bool(db, "canary_verified"):
         return "CANARY"
     return "LIVE"
+
+
+def sender_credentials_configured(db: Session) -> bool:
+    if not get_value(db, "gmail_user"):
+        return False
+    if get_value(db, "email_transport", DEFAULT_SETTINGS["email_transport"]) == "gmail_api":
+        return all(
+            bool(get_value(db, key))
+            for key in ("gmail_api_client_id", "gmail_api_client_secret", "gmail_api_refresh_token")
+        )
+    return bool(get_value(db, "gmail_app_password"))

@@ -8,12 +8,18 @@ from conftest import configure_sender
 def test_settings_encrypts_secrets_and_returns_only_fingerprints(client):
     secret = "valid-app-password"
     key = "groq-test-one"
+    gmail_api_secret = "gmail-api-client-secret"
+    gmail_api_refresh_token = "gmail-api-refresh-token"
 
     response = client.post(
         "/api/settings",
         json={
             "gmail_user": "sender@example.com",
             "gmail_app_password": secret,
+            "email_transport": "gmail_api",
+            "gmail_api_client_id": "gmail-api-client-id",
+            "gmail_api_client_secret": gmail_api_secret,
+            "gmail_api_refresh_token": gmail_api_refresh_token,
             "report_recipient": "report@example.com",
             "campaign_context": "Plain text campaign context",
             "sender_name": "Ross Dmello",
@@ -38,6 +44,8 @@ def test_settings_encrypts_secrets_and_returns_only_fingerprints(client):
     body = response.json()
     assert secret not in str(body)
     assert key not in str(body)
+    assert gmail_api_secret not in str(body)
+    assert gmail_api_refresh_token not in str(body)
     assert body["groq_keys_count"] == 2
     assert body["groq_keys_fingerprints"][0] == fingerprint(key)
     assert body["campaign_context"] == "Plain text campaign context"
@@ -49,16 +57,24 @@ def test_settings_encrypts_secrets_and_returns_only_fingerprints(client):
     assert body["warm_up_mode"] is True
     assert body["warm_up_current_limit"] == 5
     assert body["imap_fetch_interval_minutes"] == 7
+    assert body["email_transport"] == "gmail_api"
+    assert body["gmail_api_configured"] is True
 
     get_body = client.get("/api/settings").json()
     assert secret not in str(get_body)
     assert key not in str(get_body)
+    assert gmail_api_secret not in str(get_body)
+    assert gmail_api_refresh_token not in str(get_body)
     assert get_body["gmail_app_password_configured"] is True
 
     with SessionLocal() as db:
         stored_password = db.query(Setting).filter_by(key="gmail_app_password").one().value
+        stored_api_secret = db.query(Setting).filter_by(key="gmail_api_client_secret").one().value
+        stored_refresh_token = db.query(Setting).filter_by(key="gmail_api_refresh_token").one().value
         stored_keys = db.query(Setting).filter_by(key="groq_keys").one().value
     assert secret not in stored_password
+    assert gmail_api_secret not in stored_api_secret
+    assert gmail_api_refresh_token not in stored_refresh_token
     assert key not in stored_keys
 
 
@@ -69,6 +85,9 @@ def test_smtp_verify_uses_fake_transport_and_redacts_failures(client):
     assert ok["readiness"] == "smtp_verified"
     assert ok.get("error_detail") is None
 
+    ok_alias = client.post("/api/settings/verify-email").json()
+    assert ok_alias["readiness"] == "smtp_verified"
+
     response = client.post(
         "/api/settings",
         json={"gmail_user": "sender@example.com", "gmail_app_password": "wrong-password"},
@@ -78,6 +97,28 @@ def test_smtp_verify_uses_fake_transport_and_redacts_failures(client):
     failed = client.post("/api/settings/verify-smtp").json()
     assert failed["readiness"] == "failed"
     assert "wrong-password" not in str(failed)
+
+
+def test_gmail_api_settings_configure_sender_without_app_password(client):
+    response = client.post(
+        "/api/settings",
+        json={
+            "gmail_user": "sender@example.com",
+            "email_transport": "gmail_api",
+            "gmail_api_client_id": "client-id",
+            "gmail_api_client_secret": "client-secret",
+            "gmail_api_refresh_token": "refresh-token",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["email_transport"] == "gmail_api"
+    assert body["gmail_app_password_configured"] is False
+    assert body["gmail_api_configured"] is True
+    assert body["sender_readiness"] == "configured"
+    assert "client-secret" not in str(body)
+    assert "refresh-token" not in str(body)
 
 
 def test_canary_send_success_and_duplicate_block(client):

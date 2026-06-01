@@ -20,7 +20,7 @@ from app.core.time import iso, utcnow
 from app.db.models import Contact, ConversationMessage, Draft, Reply, SendAttempt, Suppression
 from app.db.session import get_db
 from app.send.smtp_adapter import GmailAdapter
-from app.settings.service import get_bool, get_effective_daily_send_cap, get_int, get_key_list, get_secret, get_value
+from app.settings.service import get_bool, get_effective_daily_send_cap, get_int, get_key_list, get_secret, get_value, sender_credentials_configured
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 GROQ_CONVERSATION_CHAR_LIMIT = 90_000
@@ -230,7 +230,7 @@ async def send_conversation_reply(contact_id: str, payload: ConversationSend, db
         raise HTTPException(status_code=409, detail="sender not canary verified")
     user = get_value(db, "gmail_user")
     password = get_secret(db, "gmail_app_password")
-    if not user or not password:
+    if not sender_credentials_configured(db):
         raise HTTPException(status_code=409, detail="sender not configured")
     block_reasons = _engaged_send_block_reasons(db, contact)
     if block_reasons:
@@ -253,7 +253,7 @@ async def send_conversation_reply(contact_id: str, payload: ConversationSend, db
         db.commit()
         return {"status": "skipped", "error_code": "dry_run"}
 
-    result = await GmailAdapter().send_message(contact.email, payload.subject, payload.body, user, password)
+    result = await GmailAdapter.from_settings(db).send_message(contact.email, payload.subject, payload.body, user, password)
     if result.status != "success":
         db.add(
             SendAttempt(

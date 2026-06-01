@@ -1,12 +1,15 @@
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers: Record<string, string> = {
+    ...((init?.headers as Record<string, string> | undefined) ?? {})
+  };
+  if (init?.body !== undefined && !("Content-Type" in headers)) {
+    headers["Content-Type"] = "application/json";
+  }
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {})
-    }
+    headers
   });
   if (!response.ok) {
     throw new Error(await response.text());
@@ -28,6 +31,7 @@ export const api = {
   getSettings: () => request<SettingsRead>("/api/settings"),
   updateSettings: (payload: Record<string, unknown>) =>
     request<SettingsRead>("/api/settings", { method: "POST", body: JSON.stringify(payload) }),
+  verifyEmail: () => request<{ readiness: string; error_code?: string }>("/api/settings/verify-email", { method: "POST" }),
   verifySmtp: () => request<{ readiness: string; error_code?: string }>("/api/settings/verify-smtp", { method: "POST" }),
   sendCanary: () => request<CanaryResult>("/api/canary/send", { method: "POST" }),
   listProviderHealth: () => request<ListResponse<ProviderHealth>>("/api/provider-health"),
@@ -110,7 +114,9 @@ export const api = {
 
 export type SettingsRead = {
   gmail_user: string;
+  email_transport: "smtp" | "gmail_api";
   gmail_app_password_configured: boolean;
+  gmail_api_configured: boolean;
   report_recipient: string;
   groq_keys_count: number;
   groq_keys_fingerprints: string[];

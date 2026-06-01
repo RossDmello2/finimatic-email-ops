@@ -69,7 +69,7 @@ def evaluate_policy(queue_entry: SendQueue, db: Session) -> PolicyDecision:
     gates = [
         _gate(
             "sender_verified",
-            get_value(db, "sender_readiness") in {"smtp_verified", "canary_verified"} or get_bool(db, "canary_verified"),
+            get_value(db, "sender_readiness") in {"smtp_verified", "provider_verified", "canary_verified"} or get_bool(db, "canary_verified"),
             "SENDER_NOT_VERIFIED",
         ),
         _gate("canary_verified", get_bool(db, "canary_verified"), "CANARY_NOT_VERIFIED"),

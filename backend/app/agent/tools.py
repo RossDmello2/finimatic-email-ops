@@ -25,7 +25,7 @@ from app.core.idempotency import sha256_key
 from app.core.time import iso, utcnow
 from app.db.models import AgentSession, Contact, ConversationMessage, Draft, FollowUpSequence, PendingEmailActionRow, Reply, SendAttempt, SendQueue, Suppression
 from app.send.smtp_adapter import GmailAdapter
-from app.settings.service import get_bool, get_effective_daily_send_cap, get_int, get_key_list, get_secret, get_value
+from app.settings.service import get_bool, get_effective_daily_send_cap, get_int, get_key_list, get_secret, get_value, sender_credentials_configured
 
 GMAIL_APP_SECRET_KEY = "gmail_" + "app_" + "password"
 SECRET_RE = re.compile(
@@ -557,13 +557,8 @@ class AgenticToolExecutor:
         body = resolve_tokens(draft.body, contact)
 
         sent_at = utcnow()
-        loop = asyncio.get_event_loop()
         emit_event(db, "send.attempt", entity_type="draft", entity_id=draft.id, payload={"source": "agent"})
-
-        def call_adapter():
-            return asyncio.run(GmailAdapter().send_message(contact.email, subject, body, user, password))
-
-        result = await loop.run_in_executor(None, call_adapter)
+        result = await GmailAdapter.from_settings(db).send_message(contact.email, subject, body, user, password)
         if result.status != "success":
             db.add(
                 SendAttempt(
@@ -677,7 +672,7 @@ def _engaged_send_block_reasons(db: Session, contact: Contact) -> list[str]:
     reasons: list[str] = []
     if not get_bool(db, "canary_verified"):
         reasons.append("CANARY_NOT_VERIFIED")
-    if not get_value(db, "gmail_user") or not get_value(db, GMAIL_APP_SECRET_KEY):
+    if not sender_credentials_configured(db):
         reasons.append("SENDER_NOT_CONFIGURED")
     if get_bool(db, "dry_run"):
         reasons.append("DRY_RUN_ENABLED")

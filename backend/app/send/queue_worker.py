@@ -79,7 +79,7 @@ async def process_pending_queue(db: Session, transport=None) -> dict:
     sent = 0
     blocked = 0
     skipped = 0
-    adapter = GmailAdapter(transport=transport)
+    adapter = GmailAdapter.from_settings(db, transport=transport)
 
     for entry in entries:
         claimed = (
