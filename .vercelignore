@@ -1,4 +1,12 @@
-*
-!frontend/
-!frontend/**
-!vercel.json
+backend/
+docs/
+scripts/
+browser-evidence/
+import_templates/
+repair/
+verification_artifacts/
+.codex_tmp/
+.pytest-tmp/
+*.log
+*.png
+KEYS.md
