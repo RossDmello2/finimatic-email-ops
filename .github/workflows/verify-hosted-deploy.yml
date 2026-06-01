@@ -1,0 +1,40 @@
+name: Verify Hosted Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/verify-hosted-deploy.yml"
+      - "scripts/verify-deploy.ps1"
+  workflow_dispatch:
+    inputs:
+      backend_url:
+        description: "Backend origin to verify"
+        required: true
+        default: "https://finimatic-backend.onrender.com"
+      frontend_url:
+        description: "Frontend URL to verify"
+        required: true
+        default: "https://rossdmello2.github.io/email-automation/"
+  schedule:
+    - cron: "17 */12 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      BACKEND_URL: ${{ inputs.backend_url || 'https://finimatic-backend.onrender.com' }}
+      FRONTEND_URL: ${{ inputs.frontend_url || 'https://rossdmello2.github.io/email-automation/' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify hosted deployment
+        shell: pwsh
+        run: |
+          ./scripts/verify-deploy.ps1 `
+            -BackendUrl "$env:BACKEND_URL" `
+            -FrontendUrl "$env:FRONTEND_URL"
