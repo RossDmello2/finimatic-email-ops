@@ -169,6 +169,26 @@ VITE_API_URL=https://finimatic-backend.onrender.com
 
 This is a frontend fallback, not a backend replacement. It becomes usable after the Render backend is live and allows `https://rossdmello2.github.io` in `ALLOWED_ORIGINS`.
 
+## GitHub User-Site Published Frontend
+
+The `RossDmello2/RossDmello2.github.io` repository also contains `.github/workflows/deploy-email-automation.yml`.
+
+That workflow checks out `RossDmello2/email-automation`, builds `frontend` with:
+
+```text
+VITE_API_URL=https://finimatic-backend.onrender.com
+```
+
+and publishes the static build into:
+
+```text
+RossDmello2.github.io/email-automation/
+```
+
+Current repository evidence confirms `email-automation/index.html` exists in `RossDmello2/RossDmello2.github.io` and references the built Vite assets under `/email-automation/assets/`.
+
+This proves the static frontend artifact is published in the GitHub Pages repository. The app is still not fully usable until the Render backend is live at `https://finimatic-backend.onrender.com` and returns `{"status":"ok"}` from `/api/health`.
+
 ## Netlify Frontend Deploy
 
 A Netlify project has been created:
