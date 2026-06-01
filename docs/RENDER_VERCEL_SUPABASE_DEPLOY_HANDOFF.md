@@ -243,6 +243,14 @@ Important: the provided Supabase personal access token is not the same as a Post
 
 The repository also contains `.vercelignore`, which keeps Vercel frontend deploy uploads scoped to `frontend/**` plus `vercel.json`.
 
+`VERCEL_TOKEN` is optional for the workflow. If it is not configured, the workflow skips Vercel deployment after the Render backend step and points operators to the already-published GitHub Pages frontend:
+
+```text
+https://rossdmello2.github.io/email-automation/
+```
+
+For the backend deployment path, the required secrets are therefore `RENDER_API_KEY` and `DATABASE_URL`. `RENDER_OWNER_ID` is required only if the Render API key can see multiple workspaces.
+
 If GitHub CLI is authenticated, the helper script can configure the repository secrets from process environment variables without printing the values:
 
 ```powershell
