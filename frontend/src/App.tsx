@@ -201,8 +201,26 @@ function apiErrorMessage(error: unknown, fallback: string) {
 
 function App() {
   const [surface, setSurface] = useState<Surface>("setup");
+  const queryClient = useQueryClient();
   const data = useAppData(surface);
   const settings = data.settings.data;
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const oauthStatus = url.searchParams.get("gmail_api_oauth");
+    if (!oauthStatus) return;
+    setSurface("settings");
+    const messages: Record<string, string> = {
+      connected: "gmail_api_connected",
+      connected_unverified: "gmail_api_connected_but_verification_failed",
+      failed: "gmail_api_oauth_failed",
+      refresh_token_missing: "gmail_api_refresh_token_missing"
+    };
+    toast(messages[oauthStatus] ?? oauthStatus);
+    invalidateAll(queryClient);
+    url.searchParams.delete("gmail_api_oauth");
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  }, [queryClient]);
 
   return (
     <div className="app-root bg-[#f4f6f9] text-ink">
@@ -258,12 +276,12 @@ function SetupPanel({ settings }: { settings?: SettingsRead }) {
   const [showCanary, setShowCanary] = useState(false);
   const [canary, setCanary] = useState<{ status: string; nonce?: string; sent_at?: string; sender_identity?: string } | null>(null);
   const verify = useMutation({
-    mutationFn: api.verifySmtp,
+    mutationFn: api.verifyEmail,
     onSuccess: (result) => {
       toast(result.readiness);
       invalidateAll(queryClient);
     },
-    onError: (error) => toast(apiErrorMessage(error, "SMTP verification failed"))
+    onError: (error) => toast(apiErrorMessage(error, "Email provider verification failed"))
   });
   const canarySend = useMutation({
     mutationFn: api.sendCanary,
@@ -286,7 +304,7 @@ function SetupPanel({ settings }: { settings?: SettingsRead }) {
       action={
         <div className="flex gap-2">
           <button className={`button secondary${verify.isPending ? " is-loading" : ""}`} disabled={verify.isPending} aria-busy={verify.isPending} onClick={() => verify.mutate()}>
-            <Check className={verify.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{verify.isPending ? "Verifying..." : "Verify SMTP"}</span>
+            <Check className={verify.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{verify.isPending ? "Verifying..." : "Verify Email"}</span>
           </button>
           <button className="button primary" onClick={() => setShowCanary(true)} disabled={!settings?.report_recipient}>
             <Send className="h-4 w-4" /> Send Test Email
@@ -296,7 +314,7 @@ function SetupPanel({ settings }: { settings?: SettingsRead }) {
     >
       <div className="metrics">
         <Metric label="Sender" value={settings?.gmail_user || "missing"} />
-        <Metric label="SMTP" value={settings?.sender_readiness ?? "not_configured"} />
+        <Metric label="Email Provider" value={settings?.sender_readiness ?? "not_configured"} />
         <Metric label="Canary" value={settings?.canary_verified ? "verified" : "not verified"} />
         <Metric label="Dry run" value={settings?.dry_run ? "enabled" : "disabled"} />
         {settings?.warm_up_mode && <Metric label="Warm-up cap" value={`${settings.warm_up_current_limit ?? settings.daily_send_cap}/day`} />}
@@ -2205,7 +2223,11 @@ function ErrorsPanel({ audit }: { audit: AuditEvent[] }) {
 function SettingsPanel({ settings }: { settings?: SettingsRead }) {
   const queryClient = useQueryClient();
   const [gmailUser, setGmailUser] = useState(settings?.gmail_user ?? "");
+  const [emailTransport, setEmailTransport] = useState<"smtp" | "gmail_api">(settings?.email_transport ?? "smtp");
   const [password, setPassword] = useState("");
+  const [gmailApiClientId, setGmailApiClientId] = useState("");
+  const [gmailApiClientSecret, setGmailApiClientSecret] = useState("");
+  const [gmailApiRefreshToken, setGmailApiRefreshToken] = useState("");
   const [recipient, setRecipient] = useState(settings?.report_recipient ?? "");
   const [groq, setGroq] = useState("");
   const [gemini, setGemini] = useState("");
@@ -2239,6 +2261,7 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
   useEffect(() => {
     if (!settings) return;
     setGmailUser(settings.gmail_user);
+    setEmailTransport(settings.email_transport ?? "smtp");
     setRecipient(settings.report_recipient);
     setDailyCap(settings.daily_send_cap);
     setHourlyCap(settings.hourly_send_cap);
@@ -2279,7 +2302,11 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
   }
   const payload = () => ({
     gmail_user: gmailUser,
+    email_transport: emailTransport,
     gmail_app_password: password || undefined,
+    gmail_api_client_id: gmailApiClientId || undefined,
+    gmail_api_client_secret: gmailApiClientSecret || undefined,
+    gmail_api_refresh_token: gmailApiRefreshToken || undefined,
     report_recipient: recipient,
     groq_keys: groq || undefined,
     gemini_keys: gemini || undefined,
@@ -2316,6 +2343,9 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
       api.updateSettings(payload()),
     onSuccess: () => {
       setPassword("");
+      setGmailApiClientId("");
+      setGmailApiClientSecret("");
+      setGmailApiRefreshToken("");
       setGroq("");
       setGemini("");
       toast("settings saved");
@@ -2326,16 +2356,29 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
   const saveVerify = useMutation({
     mutationFn: async () => {
       await api.updateSettings(payload());
-      return api.verifySmtp();
+      return api.verifyEmail();
     },
     onSuccess: (result) => {
       setPassword("");
+      setGmailApiClientId("");
+      setGmailApiClientSecret("");
+      setGmailApiRefreshToken("");
       setGroq("");
       setGemini("");
       toast(result.readiness);
       invalidateAll(queryClient);
     },
-    onError: (error) => toast(apiErrorMessage(error, "settings save and SMTP verification failed"))
+    onError: (error) => toast(apiErrorMessage(error, "settings save and email verification failed"))
+  });
+  const connectGmailApi = useMutation({
+    mutationFn: async () => {
+      await api.updateSettings(payload());
+      return api.startGmailApiOAuth({ return_url: `${window.location.origin}${window.location.pathname}` });
+    },
+    onSuccess: (result) => {
+      window.location.assign(result.authorization_url);
+    },
+    onError: (error) => toast(apiErrorMessage(error, "gmail api oauth start failed"))
   });
   return (
     <Panel
@@ -2343,10 +2386,15 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
       icon={Settings}
       action={
         <div className="flex gap-2">
-          <button className={`button secondary${saveVerify.isPending ? " is-loading" : ""}`} disabled={saveVerify.isPending || save.isPending} aria-busy={saveVerify.isPending} onClick={() => saveVerify.mutate()}>
-            <Check className={saveVerify.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{saveVerify.isPending ? "Verifying..." : "Save & Verify SMTP"}</span>
+          {emailTransport === "gmail_api" && (
+            <button className={`button secondary${connectGmailApi.isPending ? " is-loading" : ""}`} disabled={saveVerify.isPending || save.isPending || connectGmailApi.isPending} aria-busy={connectGmailApi.isPending} onClick={() => connectGmailApi.mutate()}>
+              <KeyRound className={connectGmailApi.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{connectGmailApi.isPending ? "Connecting..." : "Connect Gmail API"}</span>
+            </button>
+          )}
+          <button className={`button secondary${saveVerify.isPending ? " is-loading" : ""}`} disabled={saveVerify.isPending || save.isPending || connectGmailApi.isPending} aria-busy={saveVerify.isPending} onClick={() => saveVerify.mutate()}>
+            <Check className={saveVerify.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{saveVerify.isPending ? "Verifying..." : "Save & Verify Email"}</span>
           </button>
-          <button className={`button primary${save.isPending ? " is-loading" : ""}`} disabled={save.isPending || saveVerify.isPending} onClick={() => save.mutate()}>
+          <button className={`button primary${save.isPending ? " is-loading" : ""}`} disabled={save.isPending || saveVerify.isPending || connectGmailApi.isPending} onClick={() => save.mutate()}>
             <KeyRound className={save.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{save.isPending ? "Saving..." : "Save"}</span>
           </button>
         </div>
@@ -2354,8 +2402,19 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
     >
       <div className="form-grid">
         <label>Gmail User<input value={gmailUser} onChange={(e) => setGmailUser(e.target.value)} /></label>
-        <label>App Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+        <label>Email Transport<select value={emailTransport} onChange={(e) => setEmailTransport(e.target.value as "smtp" | "gmail_api")}><option value="smtp">Gmail SMTP</option><option value="gmail_api">Gmail API</option></select></label>
+        <label>Gmail App Password (SMTP/IMAP)<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={settings?.gmail_app_password_configured ? "configured" : ""} /></label>
         <label>Report Recipient<input value={recipient} onChange={(e) => setRecipient(e.target.value)} /></label>
+        {emailTransport === "gmail_api" && (
+          <>
+            <label>Gmail API Client ID<input type="password" value={gmailApiClientId} onChange={(e) => setGmailApiClientId(e.target.value)} placeholder={settings?.gmail_api_configured ? "configured" : ""} /></label>
+            <label>Gmail API Client Secret<input type="password" value={gmailApiClientSecret} onChange={(e) => setGmailApiClientSecret(e.target.value)} placeholder={settings?.gmail_api_configured ? "configured" : ""} /></label>
+            <label>Gmail API Refresh Token<input type="password" value={gmailApiRefreshToken} onChange={(e) => setGmailApiRefreshToken(e.target.value)} placeholder={settings?.gmail_api_configured ? "configured" : ""} /></label>
+            <div className="notice">
+              Hosted Gmail sends use Google OAuth. SMTP/IMAP app passwords are not used by Gmail API.
+            </div>
+          </>
+        )}
         <label>Daily Cap<input type="number" value={dailyCap} onChange={(e) => setDailyCap(Number(e.target.value))} /></label>
         <label>Hourly Cap<input type="number" value={hourlyCap} onChange={(e) => setHourlyCap(Number(e.target.value))} /></label>
         <label>Send Delay<input type="number" value={delay} onChange={(e) => setDelay(Number(e.target.value))} /></label>

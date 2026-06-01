@@ -1,0 +1,228 @@
+name: Manual Platform Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/manual-platform-deploy.yml"
+  workflow_dispatch:
+    inputs:
+      vercel_project:
+        description: "Vercel project name to create/use"
+        required: true
+        default: "finimatic-frontend"
+      vercel_scope:
+        description: "Vercel team/user scope; leave blank to use token default"
+        required: false
+        default: "crce9955ce-8405s-projects"
+      render_service:
+        description: "Render web service name to create"
+        required: true
+        default: "finimatic-backend"
+      allowed_origins:
+        description: "Comma-separated frontend origins for backend CORS"
+        required: true
+        default: "https://finimatic-frontend.vercel.app,https://finimatic-rossdmello2.netlify.app,https://rossdmello2.github.io"
+      frontend_url:
+        description: "Frontend origin used after Gmail API OAuth callback"
+        required: true
+        default: "https://finimatic-frontend.vercel.app/"
+
+jobs:
+  create-render-backend:
+    name: Create Render backend
+    runs-on: ubuntu-latest
+    outputs:
+      backend_url: ${{ steps.render.outputs.backend_url }}
+    steps:
+      - name: Create Render service
+        id: render
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          FERNET_KEY: ${{ secrets.FERNET_KEY }}
+          SERVICE_NAME: ${{ inputs.render_service || 'finimatic-backend' }}
+          ALLOWED_ORIGINS: ${{ inputs.allowed_origins || 'https://finimatic-frontend.vercel.app,https://finimatic-rossdmello2.netlify.app,https://rossdmello2.github.io' }}
+          FRONTEND_URL: ${{ inputs.frontend_url || 'https://finimatic-frontend.vercel.app/' }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import base64
+          import sys
+          import urllib.error
+          import urllib.request
+
+          required = ["RENDER_API_KEY", "DATABASE_URL"]
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              print(f"Missing required secret(s): {', '.join(missing)}", file=sys.stderr)
+              sys.exit(1)
+
+          headers = {
+              "Authorization": f"Bearer {os.environ['RENDER_API_KEY']}",
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+          }
+
+          def request(method, path, body=None):
+              data = None if body is None else json.dumps(body).encode("utf-8")
+              req = urllib.request.Request(
+                  f"https://api.render.com/v1{path}",
+                  data=data,
+                  headers=headers,
+                  method=method,
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as response:
+                      raw = response.read().decode("utf-8")
+                      return response.status, json.loads(raw) if raw else None
+              except urllib.error.HTTPError as exc:
+                  raw = exc.read().decode("utf-8")
+                  return exc.code, json.loads(raw) if raw else None
+
+          def render_error(label, status, body):
+              message = None
+              if isinstance(body, dict):
+                  message = body.get("message") or body.get("error")
+              print(f"{label}: HTTP {status}: {message or 'no message'}", file=sys.stderr)
+
+          def unwrap_resource(item, key):
+              if isinstance(item, dict) and isinstance(item.get(key), dict):
+                  return item[key]
+              return item
+
+          def discover_owner_id():
+              status, body = request("GET", "/owners?limit=100")
+              if status != 200:
+                  render_error("Render workspace discovery failed", status, body)
+                  sys.exit(1)
+              owners = [
+                  unwrap_resource(item, "owner")
+                  for item in (body or [])
+                  if isinstance(unwrap_resource(item, "owner"), dict)
+              ]
+              if len(owners) == 1 and owners[0].get("id"):
+                  return owners[0]["id"]
+              if not owners:
+                  print("No Render workspaces were visible to this API key.", file=sys.stderr)
+              else:
+                  choices = ", ".join(
+                      f"{owner.get('name', 'unnamed')}={owner.get('id', 'missing-id')}"
+                      for owner in owners
+                  )
+                  print(
+                      "Multiple Render workspaces are visible. Set GitHub secret "
+                      f"RENDER_OWNER_ID to one of: {choices}",
+                      file=sys.stderr,
+                  )
+              sys.exit(1)
+
+          owner_id = os.environ.get("RENDER_OWNER_ID") or discover_owner_id()
+          service_name = os.environ["SERVICE_NAME"]
+          fallback_url = f"https://{service_name}.onrender.com"
+          fernet_key = os.environ.get("FERNET_KEY") or base64.urlsafe_b64encode(os.urandom(32)).decode("ascii")
+          gmail_oauth_redirect_uri = f"{fallback_url}/api/settings/gmail-api/oauth/callback"
+
+          payload = {
+              "type": "web_service",
+              "name": service_name,
+              "ownerId": owner_id,
+              "repo": "https://github.com/RossDmello2/finimatic-email-ops",
+              "branch": "main",
+              "rootDir": "backend",
+              "autoDeploy": "yes",
+              "envVars": [
+                  {"key": "FERNET_KEY", "value": fernet_key},
+                  {"key": "DATABASE_URL", "value": os.environ["DATABASE_URL"]},
+                  {"key": "ALLOWED_ORIGINS", "value": os.environ["ALLOWED_ORIGINS"]},
+                  {"key": "FRONTEND_URL", "value": os.environ["FRONTEND_URL"]},
+                  {"key": "GMAIL_OAUTH_REDIRECT_URI", "value": gmail_oauth_redirect_uri},
+                  {"key": "FINIMATIC_DISABLE_SCHEDULER", "value": "0"},
+              ],
+              "serviceDetails": {
+                  "runtime": "python",
+                  "plan": "free",
+                  "region": "singapore",
+                  "healthCheckPath": "/api/health",
+                  "envSpecificDetails": {
+                      "buildCommand": "pip install -r requirements.txt",
+                      "startCommand": "uvicorn app.main:app --host 0.0.0.0 --port $PORT",
+                  },
+              },
+          }
+
+          status, created = request("POST", "/services", payload)
+          if status == 409:
+              render_error("Render service already exists or name conflicts", status, created)
+              sys.exit(1)
+          if status != 201:
+              render_error("Render service creation failed", status, created)
+              sys.exit(1)
+
+          service = (created or {}).get("service", {})
+          url = (
+              service.get("serviceDetails", {}).get("url")
+              or service.get("url")
+              or fallback_url
+          )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"backend_url={url}\n")
+
+          print(f"Render backend URL candidate: {url}")
+          PY
+
+  deploy-vercel-frontend:
+    name: Deploy optional Vercel frontend
+    needs: create-render-backend
+    runs-on: ubuntu-latest
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_SCOPE: ${{ secrets.VERCEL_SCOPE }}
+      VERCEL_SCOPE_INPUT: ${{ inputs.vercel_scope || 'crce9955ce-8405s-projects' }}
+      VERCEL_PROJECT: ${{ inputs.vercel_project || 'finimatic-frontend' }}
+      VITE_API_URL: ${{ needs.create-render-backend.outputs.backend_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Deploy frontend
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "VERCEL_TOKEN is not configured. Skipping Vercel deploy."
+            echo "Use the existing Vercel frontend instead:"
+            echo "https://finimatic-frontend.vercel.app/"
+            exit 0
+          fi
+
+          vercel_scope="${VERCEL_SCOPE:-$VERCEL_SCOPE_INPUT}"
+          scope_args=()
+          if [ -n "$vercel_scope" ]; then
+            scope_args=(--scope "$vercel_scope")
+          fi
+
+          vercel link \
+            --yes \
+            --project "$VERCEL_PROJECT" \
+            --token "$VERCEL_TOKEN" \
+            "${scope_args[@]}"
+
+          vercel deploy \
+            --prod \
+            --yes \
+            --token "$VERCEL_TOKEN" \
+            --build-env "VITE_API_URL=$VITE_API_URL" \
+            --env "VITE_API_URL=$VITE_API_URL" \
+            "${scope_args[@]}"
