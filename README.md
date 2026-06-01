@@ -18,11 +18,11 @@ The banner is generated conceptual artwork for README presentation. The product 
 
 ![Conceptual Finimatic email operations workflow banner](docs/assets/brand/hero.png)
 
-![Finimatic drafts dashboard with approved draft review controls](docs/assets/screenshots/home.png)
+![Finimatic drafts dashboard with approved draft review controls](docs/assets/screenshots/drafts-dashboard.png)
 
-![Finimatic replies and stop-state tracking dashboard](docs/assets/screenshots/main-workflow.png)
+![Finimatic replies and stop-state tracking dashboard](docs/assets/screenshots/replies-stops-dashboard.png)
 
-![Finimatic campaign builder with floating assistant open](docs/assets/screenshots/mobile.png)
+![Finimatic campaign builder with floating assistant open](docs/assets/screenshots/campaign-assistant.png)
 
 ## What It Does
 
