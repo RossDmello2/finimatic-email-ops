@@ -26,7 +26,7 @@ Supabase project:
 GitHub repository:
 
 ```text
-https://github.com/RossDmello2/email-automation
+https://github.com/RossDmello2/finimatic-email-ops
 ```
 
 Deployment files are present in the repository:
@@ -94,7 +94,7 @@ Use the Blueprint because `render.yaml` is already committed.
 Dashboard link:
 
 ```text
-https://dashboard.render.com/blueprint/new?repo=https://github.com/RossDmello2/email-automation
+https://dashboard.render.com/blueprint/new?repo=https://github.com/RossDmello2/finimatic-email-ops
 ```
 
 Expected service from `render.yaml`:
@@ -192,7 +192,7 @@ This is a frontend fallback, not a backend replacement. It becomes usable after 
 
 The `RossDmello2/RossDmello2.github.io` repository also contains `.github/workflows/deploy-email-automation.yml`.
 
-That workflow checks out `RossDmello2/email-automation`, builds `frontend` with:
+That workflow checks out `RossDmello2/finimatic-email-ops`, builds `frontend` with:
 
 ```text
 VITE_API_URL=https://finimatic-backend.onrender.com
@@ -205,6 +205,8 @@ RossDmello2.github.io/email-automation/
 ```
 
 Current repository evidence confirms `email-automation/index.html` exists in `RossDmello2/RossDmello2.github.io` and references the built Vite assets under `/email-automation/assets/`.
+
+Repository rename note: the source repository is now `RossDmello2/finimatic-email-ops`. The published GitHub Pages path above is a deployment path in `RossDmello2/RossDmello2.github.io`, not the source repository slug. Change that path only in a separate deployment workflow pass.
 
 This proves the static frontend artifact is published in the GitHub Pages repository. The app is still not fully usable until the Render backend is live at `https://finimatic-backend.onrender.com` and returns `{"status":"ok"}` from `/api/health`.
 

@@ -2,7 +2,7 @@
 
 Local-first, human-approved cold email operations with Gmail, AI-assisted drafting, policy gates, reply tracking, follow-ups, and audit logs.
 
-[![CI](https://github.com/RossDmello2/email-automation/actions/workflows/ci.yml/badge.svg)](https://github.com/RossDmello2/email-automation/actions/workflows/ci.yml)
+[![CI](https://github.com/RossDmello2/finimatic-email-ops/actions/workflows/ci.yml/badge.svg)](https://github.com/RossDmello2/finimatic-email-ops/actions/workflows/ci.yml)
 [![Backend](https://img.shields.io/badge/backend-FastAPI-009688)](https://fastapi.tiangolo.com/)
 [![Frontend](https://img.shields.io/badge/frontend-React%20%2B%20Vite-646CFF)](https://vitejs.dev/)
 [![Database](https://img.shields.io/badge/database-SQLAlchemy%20%2B%20SQLite%2FPostgreSQL-336791)](https://www.sqlalchemy.org/)
@@ -170,8 +170,8 @@ Manual drafting and fake transport tests can run without AI keys.
 Clone the repository:
 
 ```bash
-git clone https://github.com/RossDmello2/email-automation.git
-cd email-automation
+git clone https://github.com/RossDmello2/finimatic-email-ops.git
+cd finimatic-email-ops
 ```
 
 Set up the backend:

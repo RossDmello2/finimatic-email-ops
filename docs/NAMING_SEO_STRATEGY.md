@@ -8,11 +8,11 @@ Scope: GitHub-facing identity, README positioning, search terms, naming options,
 
 | Item | Current State | Evidence | Assessment |
 | --- | --- | --- | --- |
-| GitHub repository | `RossDmello2/email-automation` | `git remote -v`; `gh repo view RossDmello2/email-automation` | Searchable but generic. It says the category, not the strongest differentiator. |
+| GitHub repository | `RossDmello2/finimatic-email-ops` | `git remote -v`; `gh repo view RossDmello2/finimatic-email-ops` | Stronger than the former `email-automation` slug because it keeps the brand and adds the category cue. |
 | README title | `Finimatic Email Ops` | `README.md:1` | Better than brand-only because it keeps the name while adding a category cue. |
 | README subtitle | Local-first, human-approved cold email operations with Gmail, AI-assisted drafting, policy gates, reply tracking, follow-ups, and audit logs. | `README.md:3` | Clear in the first few seconds and avoids fake production claims. |
-| GitHub description | Open-source FastAPI + React dashboard for self-hosted cold email operations: import leads, draft with Groq/Gemini, approve sends, track replies/follow-ups, and audit actions. | `gh repo view RossDmello2/email-automation --json description` | Clear, searchable, and honest. It now includes category, stack, deployment model, and workflow verbs. |
-| Topics | 20 topics covering email, stack, AI, Gmail, and governance | `gh repo view RossDmello2/email-automation --json repositoryTopics` | Good baseline. Should shift from generic `email-marketing` to `email-outreach`, `self-hosted`, and `local-first`. |
+| GitHub description | Open-source FastAPI + React dashboard for self-hosted cold email operations: import leads, draft with Groq/Gemini, approve sends, track replies/follow-ups, and audit actions. | `gh repo view RossDmello2/finimatic-email-ops --json description` | Clear, searchable, and honest. It includes category, stack, deployment model, and workflow verbs. |
+| Topics | 20 topics covering email, stack, AI, Gmail, and governance | `gh repo view RossDmello2/finimatic-email-ops --json repositoryTopics` | Good baseline for discoverability without keyword stuffing. |
 | First paragraph | Open-source self-hosted email operations dashboard built with FastAPI, React, Vite, SQLAlchemy, Gmail SMTP/IMAP, Groq, and Gemini. | `README.md:9` | Stronger than framework-only copy because it says category, use case, and stack. |
 | Visuals | Conceptual hero plus three sanitized product screenshots | `README.md:19-25`; `docs/assets/brand/hero.png`; `docs/assets/screenshots/*.png` | Good trust signal. Real screenshots remain separate from generated artwork. |
 
@@ -159,21 +159,22 @@ Risk/tradeoff: very clear, but less ownable and less memorable than Finimatic.
 
 ## Final Recommendation
 
-Keep the current GitHub repository slug `email-automation` until the owner explicitly approves a rename. The current slug is generic but not harmful, and renaming would affect clone URLs, GitHub Pages paths, badges, CI references, deployment docs, and external links.
+The owner approved renaming the GitHub repository from `email-automation` to `finimatic-email-ops`. This improves GitHub search clarity while preserving the Finimatic brand.
 
 Recommended display identity now:
 
 - README title: `Finimatic Email Ops`
+- Repository slug: `finimatic-email-ops`
 - Short tagline: `Local-first, human-approved cold email operations with Gmail, AI-assisted drafting, policy gates, reply tracking, follow-ups, and audit logs.`
 - Public category: `self-hosted cold email operations dashboard`
 
-Recommended repo rename only if explicitly approved:
+Rename command used after owner approval:
 
 ```powershell
 gh repo rename finimatic-email-ops --repo RossDmello2/email-automation
 ```
 
-Before running a rename, update any GitHub Pages paths, badges, deployment docs, local remotes, and external deployment settings that reference `email-automation`.
+After a rename, update badges, clone examples, repository links, local remotes, and any deployment settings that intentionally depend on the repository slug. Deployment workflow behavior should be changed only in a separate deployment-focused pass.
 
 ## Visual Strategy
 
