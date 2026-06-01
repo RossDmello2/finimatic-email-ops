@@ -4,6 +4,8 @@ Date: 2026-05-27
 Workspace: `C:\Users\rossd\OneDrive\Documents\notes\email`
 Scope: read-only source, schema, API, and deployment-hosting audit for the current web application.
 
+Update for public repository readers: this report is a historical deployment audit. The PostgreSQL driver gap identified below has since been addressed in `backend/requirements.txt` with `psycopg[binary]`; the authentication/access-control warning remains the primary public deployment blocker.
+
 ## Verification Summary
 
 This report is grounded in live source and runtime-adjacent checks, not only older docs.
@@ -32,15 +34,15 @@ Best fit for the current architecture:
 
 1. Frontend: Vercel static site from `frontend/`.
 2. Backend: Render web service from `backend/`.
-3. Database: do not treat the checked-in/local SQLite file as production storage. Use Render PostgreSQL after adding a PostgreSQL driver, or use a Render persistent disk with SQLite only as a small single-instance stopgap.
+3. Database: do not treat any local SQLite file as production storage. Use Render PostgreSQL with the included `psycopg[binary]` dependency, or use a Render persistent disk with SQLite only as a small single-instance stopgap.
 
 Important blocker before public hosting:
 
 The current backend has no application authentication layer. CORS only limits browser calls from other origins; it does not stop direct HTTP clients. Publicly exposing this backend with real Gmail credentials means anyone who can reach the API can attempt settings changes, imports, queue operations, agent chat, confirmation flows, and other state-changing operations. Do not deploy this publicly with real credentials until authentication or network-level access control is added.
 
-Secondary blocker for PostgreSQL:
+PostgreSQL dependency note:
 
-`STACK.md` describes PostgreSQL as a production option, and the SQLAlchemy code can accept `DATABASE_URL`, but `backend/requirements.txt` currently does not include a PostgreSQL driver such as `psycopg` or `psycopg2-binary`. A PostgreSQL `DATABASE_URL` will not work on a clean host until that dependency is added.
+`STACK.md` describes PostgreSQL as a production option, and the SQLAlchemy code can accept `DATABASE_URL`. The public repository now includes `psycopg[binary]` in `backend/requirements.txt`, so the earlier missing-driver finding is superseded. Authentication or private access control is still required before public hosting with real credentials.
 
 ## What The Frontend Is
 
@@ -724,7 +726,7 @@ Must do before public production:
 
 - Add authentication or restrict the backend to trusted users/networks. This is the main blocker.
 - Decide DB strategy:
-  - Preferred: PostgreSQL on Render, but add a PostgreSQL driver to backend requirements first.
+  - Preferred: PostgreSQL on Render using the included `psycopg[binary]` dependency.
   - Stopgap: SQLite on a persistent disk with exactly one backend instance.
 - Set a durable `FERNET_KEY`.
 - Set `ALLOWED_ORIGINS` to the exact frontend domain.
@@ -733,7 +735,7 @@ Must do before public production:
 - Do not run multiple backend instances unless queue/follow-up workers are externalized or made distributed-lock safe.
 - Do not place Gmail, Groq, Gemini, or Fernet secrets in frontend env vars.
 - Do not commit `backend/.env`, DB files, logs, or `KEYS.md`.
-- Commit and push the repository before Git-based Vercel/Render deploy. Current git state has no commits and all files are untracked.
+- Commit and push the repository before Git-based Vercel/Render deploy.
 
 Useful smoke tests after deployment:
 
@@ -755,12 +757,12 @@ Useful smoke tests after deployment:
 These are source-backed risks, not speculation:
 
 - No auth layer protects public API routes.
-- PostgreSQL production path lacks a driver dependency in `backend/requirements.txt`.
+- PostgreSQL production path has a driver dependency in `backend/requirements.txt`; production database configuration still needs to be tested on the target host.
 - Runtime schema creation is active; production migrations are not the sole schema control path.
 - Background workers run inside the web process. Multiple backend replicas could duplicate queue/follow-up work.
 - Bulk draft job state is in process memory, so jobs will be lost on restart.
 - SQLite local DB files are ignored and should not be treated as portable production state.
-- Current git repository has no commits; most hosting workflows require a pushed commit history.
+- Git-based hosting workflows require the public repository to stay pushed and current.
 
 ## Clean Verification Results
 

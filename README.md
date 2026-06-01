@@ -10,6 +10,18 @@ Finimatic is a governed cold-email operations system. It helps an operator impor
 
 The core safety idea is simple: AI may suggest text and summarize bounded data, but backend code owns every credential, policy check, audit record, confirmation, and send action.
 
+> Public deployment warning: this repository does not include an authentication layer. Run it locally, behind private access, or add authentication before exposing the backend with real Gmail or provider credentials.
+
+## Preview
+
+The screenshots below are captured from the running app with demo-safe or redacted values.
+
+![Finimatic setup dashboard](docs/assets/screenshots/home.png)
+
+![Finimatic assistant panel with demo-safe data](docs/assets/screenshots/main-workflow.png)
+
+![Finimatic responsive mobile dashboard](docs/assets/screenshots/mobile.png)
+
 ## What This Project Does
 
 - Imports contacts from manual entry, pasted text, CSV, or TXT.
@@ -54,7 +66,7 @@ Important boundaries:
 | Backend | Python, FastAPI, SQLAlchemy, Pydantic, APScheduler |
 | Frontend | React 18, TypeScript, Vite, TanStack Query, lucide-react, sonner |
 | Database | SQLite for local development, PostgreSQL-capable SQLAlchemy URL for production |
-| Email | Gmail SMTP and IMAP adapters |
+| Email | Gmail SMTP/IMAP adapters with fake transport support for tests |
 | AI | Groq and Gemini, configured through the app Settings screen |
 | Tests | pytest, FastAPI TestClient, Vite/TypeScript build |
 
@@ -265,7 +277,7 @@ See [docs/API_REFERENCE.md](docs/API_REFERENCE.md) for the route map.
 
 Local development uses SQLite by default. The SQLAlchemy models are in `backend/app/db/models.py`; the documented schema is in [SCHEMA.md](SCHEMA.md).
 
-For production, use a persistent database. If you choose PostgreSQL, confirm the required PostgreSQL driver is installed in the backend environment before deploying.
+For production, use a persistent database. The backend requirements include `psycopg[binary]` for PostgreSQL-backed deployments.
 
 ## Deployment
 
@@ -285,9 +297,10 @@ Read [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) before deploying. The deployment g
 - [Deployment Guide](docs/DEPLOYMENT.md)
 - [Database Schema](SCHEMA.md)
 - [Tech Stack](STACK.md)
+- [Testing Guide](TESTING.md)
 - [Data Flow](DATA_FLOW.md)
 - [Implementation Report](PROJECT_IMPLEMENTATION_REPORT.md)
-- [Deployment Intelligence Report](DEPLOYMENT_INTELLIGENCE_REPORT.md)
+- [Deployment Intelligence Report](DEPLOYMENT_INTELLIGENCE_REPORT.md) historical deployment audit with current caveats
 
 ## Security Notes
 
@@ -301,6 +314,8 @@ See [SECURITY.md](SECURITY.md) for reporting and operational guidance.
 
 ## Current Status
 
+READY WITH GAPS.
+
 This repository contains a working local-first email operations app with backend tests and a production buildable frontend. It is not a hosted SaaS template out of the box.
 
 Known deployment considerations:
@@ -308,7 +323,7 @@ Known deployment considerations:
 - Authentication is not included. Put the app behind private access or add auth before public use.
 - SQLite is fine for local development, but production should use durable storage.
 - Gmail app passwords and provider API keys must be configured through Settings, not committed.
-- Browser and Gmail proof artifacts in the repository are evidence snapshots, not live guarantees.
+- Public screenshots are sanitized examples, not live Gmail delivery guarantees.
 
 ## Contributing
 
