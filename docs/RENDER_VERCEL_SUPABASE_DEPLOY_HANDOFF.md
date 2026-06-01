@@ -122,6 +122,25 @@ Expected response:
 {"status":"ok"}
 ```
 
+## Render CLI Backend Deploy
+
+The repository contains `scripts/create-render-backend.ps1` for a non-dashboard Render CLI path.
+
+Prerequisites:
+
+- `render login` has completed in the current Windows user session.
+- `DATABASE_URL` is set in the current PowerShell process to the Supabase Session Pooler connection string.
+- Optional: `FERNET_KEY` is set if you want to reuse existing encrypted settings.
+
+Run:
+
+```powershell
+$env:DATABASE_URL = "<supabase session pooler url>"
+.\scripts\create-render-backend.ps1
+```
+
+The script creates the `finimatic-backend` Render Free web service from the GitHub repository with the same build/start/health-check settings as `render.yaml`.
+
 ## Vercel Frontend Deploy
 
 Import the same GitHub repository into Vercel.
