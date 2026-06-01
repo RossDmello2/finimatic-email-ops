@@ -4,7 +4,7 @@ Use this file to decide where to ask for help.
 
 ## Questions
 
-Open a GitHub Discussion if discussions are enabled. Otherwise, open an issue with the `question` label.
+Open a GitHub issue with the `question` label. If Discussions are enabled later, project maintainers may move general questions there.
 
 Include:
 

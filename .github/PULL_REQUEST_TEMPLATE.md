@@ -8,6 +8,8 @@ Describe what changed and why.
 - [ ] Frontend build: `cd frontend && npm run build`
 - [ ] Documentation updated if behavior changed
 - [ ] No secrets, database files, logs, or build output committed
+- [ ] `git diff --check` passes
+- [ ] UI changes include sanitized screenshots, if applicable
 
 ## Security Checklist
 
@@ -16,3 +18,5 @@ Describe what changed and why.
 - [ ] Email sends remain policy-gated
 - [ ] Assistant sends remain pending-action and confirmation-gated
 - [ ] Audit behavior preserved for side-effecting actions
+- [ ] Any database migration or schema change is explained
+- [ ] Any live email, IMAP, queue, or scheduler side effect is called out

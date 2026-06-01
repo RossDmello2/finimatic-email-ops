@@ -93,18 +93,18 @@ Open:
 http://localhost:5173
 ```
 
-## 4. Configure The App
+## 4. Configure The App Safely
 
 In the dashboard:
 
 1. Open Settings.
-2. Add Gmail sender email.
-3. Add Gmail app password.
-4. Add report recipient.
+2. Keep dry-run enabled while learning the workflow.
+3. Use fake or disposable contact data.
+4. Add Gmail sender credentials only when you are ready to test email.
 5. Optionally add Groq and Gemini keys.
 6. Save settings.
-7. Verify SMTP.
-8. Send a canary email.
+7. Verify email transport.
+8. Send a canary email before live sends.
 
 Credentials are sent to the backend and encrypted. The frontend does not store provider keys.
 
@@ -122,9 +122,17 @@ Recommended first workflow:
 8. Open Conversations.
 9. Ask the floating assistant: `who replied today?`
 
-Only move toward live sending after you understand dry-run and canary behavior.
+Only move toward live sending after you understand dry-run, canary behavior, suppressions, caps, and audit logs.
 
-## 6. Run Verification
+## 6. Learn More
+
+- [Architecture](ARCHITECTURE.md)
+- [API Reference](API_REFERENCE.md)
+- [Current Data Model](DATA_MODEL.md)
+- [Troubleshooting](TROUBLESHOOTING.md)
+- [Testing Guide](TESTING.md)
+
+## 7. Run Verification
 
 Backend:
 
@@ -140,7 +148,7 @@ cd frontend
 npm run build
 ```
 
-## 7. Common Problems
+## 8. Common Problems
 
 ### Backend cannot decrypt settings
 

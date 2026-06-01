@@ -135,7 +135,7 @@ sequenceDiagram
 
 ## Database Tables
 
-Core tables are documented in [../SCHEMA.md](../SCHEMA.md). The main groups are:
+Current tables are documented in [DATA_MODEL.md](DATA_MODEL.md). Historical schema notes live in [reference/SCHEMA.md](reference/SCHEMA.md), but current source is `backend/app/db/models.py`. The main groups are:
 
 - settings
 - contacts and imports

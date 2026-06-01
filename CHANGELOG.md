@@ -4,9 +4,11 @@ All notable project changes should be documented here.
 
 ## [Unreleased]
 
-- Added public repository documentation and community health files.
-- Added beginner-focused getting started, architecture, API, and deployment docs.
-- Added GitHub issue templates, PR template, and CI workflow.
+- Refreshed the README for open-source discovery, beginner setup, screenshots, architecture, safety boundaries, and status gaps.
+- Added a current data model guide, troubleshooting guide, reference-doc index, and generated conceptual README artwork.
+- Moved historical specs, audits, and repair notes into `docs/reference/` to reduce root clutter.
+- Expanded issue and pull request templates with transport, database, side-effect, screenshot, and secret-scan prompts.
+- Broadened `.gitignore` coverage for local keys, certs, build output, and deployment state.
 
 ## [0.1.0] - 2026-05-27
 

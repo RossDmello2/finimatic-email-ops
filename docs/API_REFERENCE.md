@@ -24,6 +24,7 @@ VITE_API_URL
 | --- | --- | --- |
 | `GET` | `/api/settings` | Read safe settings, configured flags, and key fingerprints. |
 | `POST` | `/api/settings` | Save settings and encrypted credentials. |
+| `POST` | `/api/settings/verify-email` | Verify the selected email provider transport. |
 | `POST` | `/api/settings/verify-smtp` | Verify Gmail SMTP credentials. |
 | `GET` | `/api/provider-health` | Read provider health rows. |
 
@@ -134,3 +135,35 @@ Assistant sends are protected by `pending_email_actions`. A send can execute onl
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/audit` | List redacted audit events. |
+
+## Safe Local Examples
+
+Health check:
+
+```bash
+curl http://127.0.0.1:8000/api/health
+```
+
+Read safe settings. This should return configured flags and fingerprints, not raw credentials:
+
+```bash
+curl http://127.0.0.1:8000/api/settings
+```
+
+Preview imports without committing contacts:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/import/preview \
+  -H "Content-Type: application/json" \
+  -d '{"format":"csv","content":"email,creator_name\ndemo@example.com,Demo User"}'
+```
+
+Send an assistant message with a disposable session token:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/agent/chat \
+  -H "Content-Type: application/json" \
+  -d '{"session_token":"local-demo-session","message":"who replied today?"}'
+```
+
+Avoid live send, canary, SMTP, IMAP, and provider-key examples in public issues unless all credentials and private data are redacted.

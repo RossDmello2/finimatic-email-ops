@@ -47,6 +47,29 @@ body:
     attributes:
       label: Node version
       placeholder: "20.x"
+  - type: input
+    id: commit
+    attributes:
+      label: Commit or branch
+      description: Paste the commit SHA or branch name you tested.
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Email transport mode
+      options:
+        - Not applicable
+        - Fake transport
+        - Dry-run
+        - Canary
+        - Gmail SMTP
+        - Gmail API
+    validations:
+      required: true
+  - type: input
+    id: database
+    attributes:
+      label: Database
+      placeholder: "SQLite local file, PostgreSQL, etc."
   - type: dropdown
     id: area
     attributes:
@@ -64,3 +87,8 @@ body:
         - Documentation
     validations:
       required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs or screenshots
+      description: Remove credentials, inbox contents, database rows, tokens, and private email addresses before posting.

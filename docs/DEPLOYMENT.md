@@ -18,6 +18,7 @@ Before exposing this app beyond private use:
 - Configure CORS to allow only the deployed frontend domain.
 - Confirm email sending in dry-run and canary mode before live sending.
 - Review audit logs after test sends.
+- Verify that the backend should run scheduled queue, follow-up, and IMAP work before setting `FINIMATIC_DISABLE_SCHEDULER=0`.
 
 ## Backend On Render
 
@@ -53,6 +54,13 @@ Required environment variables:
 | `DATABASE_URL` | `sqlite:///./finimatic.db` or production DB URL | Use persistent storage for production. |
 | `ALLOWED_ORIGINS` | `https://your-frontend.vercel.app` | Must match the Vercel URL. |
 | `FINIMATIC_DISABLE_SCHEDULER` | `0` | Set `1` only for no-worker deployments or diagnostics. |
+
+Optional runtime variables:
+
+| Variable | Notes |
+| --- | --- |
+| `GROQ_MODEL_FAST` | Optional Groq model override for fast classification paths. |
+| `GROQ_TIMEOUT_S` | Optional Groq timeout override. |
 
 For local fake/test behavior only:
 
@@ -156,4 +164,5 @@ Those values are encrypted in the backend database. They should not appear in `.
 - SQLite files on ephemeral hosts may be lost between deploys unless persistent disk is configured.
 - Production PostgreSQL needs the appropriate Python driver installed.
 - Gmail app passwords can be revoked or rate-limited by Google.
-- Browser/Gmail screenshots committed to this repo are historical verification artifacts, not live deployment checks.
+- Public screenshots committed to this repo are sanitized local examples, not live delivery or deployment checks.
+- Background workers can trigger email or IMAP side effects after deployment if credentials and settings enable them.

@@ -9,9 +9,10 @@ Read these first:
 - [README.md](README.md)
 - [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- [SCHEMA.md](SCHEMA.md)
-- [STACK.md](STACK.md)
-- [DATA_FLOW.md](DATA_FLOW.md)
+- [docs/DATA_MODEL.md](docs/DATA_MODEL.md)
+- [docs/API_REFERENCE.md](docs/API_REFERENCE.md)
+- [docs/TESTING.md](docs/TESTING.md)
+- [docs/reference/](docs/reference/) for historical specs and audits
 
 ## Development Setup
 
@@ -75,6 +76,7 @@ npm run build
 - Documentation was updated when behavior changed.
 - No raw keys, passwords, tokens, or database files were added.
 - Email sends remain gated by policy and confirmation where applicable.
+- UI changes include sanitized screenshots when they affect visible behavior.
 
 ## Security-Sensitive Changes
 

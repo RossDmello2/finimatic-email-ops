@@ -8,6 +8,10 @@ backend/.env
 *.sqlite
 *.sqlite3
 *.log
+*.pem
+*.key
+*.p12
+*.pfx
 __pycache__/
 .pytest_cache/
 .pytest-tmp/
@@ -22,7 +26,9 @@ htmlcov/
 venv/
 node_modules/
 dist/
+build/
 .vercel/
+.netlify/
 .codex_tmp/
 KEYS.md
 NUL

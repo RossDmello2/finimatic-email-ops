@@ -2,14 +2,14 @@
 
 ## Step 0 — Read These Files In Order Before Writing One Line Of Code
 
-1. `PROJECT_IMPLEMENTATION_REPORT.md` — canonical source of truth for everything built
-2. `SCHEMA.md`                        — existing DB tables (DO NOT ALTER ANY)
-3. `STACK.md`                         — existing tech stack (DO NOT CHANGE)
-4. `DATA_FLOW.md`                     — existing architecture (DO NOT BREAK)
-5. `AI_INTEGRATION.md`                — existing Groq/Gemini pool contracts
-6. `AGENT_SCHEMA_EXTENSION.md`        — two new DB tables + agent file structure
-7. `EMAIL_AGENTIC_ASSISTANT_HANDOFF.md` — full governed pipeline spec + pydantic schemas
-8. `VERBA_ASSISTANT_REPLICATION_GUIDE.md` — widget implementation spec (sections 4–24)
+1. `docs/reference/PROJECT_IMPLEMENTATION_REPORT.md` — historical implementation baseline
+2. `docs/reference/SCHEMA.md`                        — historical DB schema notes
+3. `docs/reference/STACK.md`                         — historical tech stack contract
+4. `docs/reference/DATA_FLOW.md`                     — historical architecture notes
+5. `docs/reference/AI_INTEGRATION.md`                — Groq/Gemini pool contracts
+6. `docs/reference/AGENT_SCHEMA_EXTENSION.md`        — two new DB tables + agent file structure
+7. `docs/reference/EMAIL_AGENTIC_ASSISTANT_HANDOFF.md` — governed pipeline spec + pydantic schemas
+8. `docs/reference/VERBA_ASSISTANT_REPLICATION_GUIDE.md` — widget implementation spec
 
 Do not touch any existing file until all eight are read.
 
@@ -49,11 +49,11 @@ frontend/src/
 ## What To Build — One Isolated Module
 
 ### Backend: `backend/app/agent/`
-See `AGENT_SCHEMA_EXTENSION.md` for exact file list and responsibility of each file.
+See `docs/reference/AGENT_SCHEMA_EXTENSION.md` for exact file list and responsibility of each file.
 
 ### Frontend: `frontend/src/features/floating-assistant/`
-See `AGENT_SCHEMA_EXTENSION.md` for exact file list.
-Follow `VERBA_ASSISTANT_REPLICATION_GUIDE.md` sections 4–24 for implementation.
+See `docs/reference/AGENT_SCHEMA_EXTENSION.md` for exact file list.
+Follow `docs/reference/VERBA_ASSISTANT_REPLICATION_GUIDE.md` sections 4-24 for implementation.
 
 ---
 
@@ -61,7 +61,7 @@ Follow `VERBA_ASSISTANT_REPLICATION_GUIDE.md` sections 4–24 for implementation
 
 Add exactly two new tables to the migration chain.
 Do NOT alter any existing table. Do NOT drop anything.
-See `AGENT_SCHEMA_EXTENSION.md` for exact SQL.
+See `docs/reference/AGENT_SCHEMA_EXTENSION.md` for exact SQL.
 
 Tables to add:
 - `agent_sessions`
@@ -206,7 +206,7 @@ POST /api/agent/chat { session_token, message, attachments? }
        STOP. Do not execute yet.
   → ResponseAgent(Groq) → final user-facing text
   → save/update agent_session context_summary
-  → emit audit_event per AGENT_SCHEMA_EXTENSION.md types
+  → emit audit_event per docs/reference/AGENT_SCHEMA_EXTENSION.md types
   → return AgentChatResponse
 ```
 
