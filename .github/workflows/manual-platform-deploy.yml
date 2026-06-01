@@ -163,7 +163,7 @@ jobs:
           PY
 
   deploy-vercel-frontend:
-    name: Deploy Vercel frontend
+    name: Deploy optional Vercel frontend
     needs: create-render-backend
     runs-on: ubuntu-latest
     env:
@@ -189,8 +189,10 @@ jobs:
       - name: Deploy frontend
         run: |
           if [ -z "$VERCEL_TOKEN" ]; then
-            echo "Missing required secret: VERCEL_TOKEN" >&2
-            exit 1
+            echo "VERCEL_TOKEN is not configured. Skipping Vercel deploy."
+            echo "Use the published GitHub Pages frontend instead:"
+            echo "https://rossdmello2.github.io/email-automation/"
+            exit 0
           fi
 
           vercel_scope="${VERCEL_SCOPE:-$VERCEL_SCOPE_INPUT}"
