@@ -1,6 +1,10 @@
 name: Manual Platform Deploy
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/manual-platform-deploy.yml"
   workflow_dispatch:
     inputs:
       vercel_project:
@@ -34,8 +38,8 @@ jobs:
           RENDER_OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           FERNET_KEY: ${{ secrets.FERNET_KEY }}
-          SERVICE_NAME: ${{ inputs.render_service }}
-          ALLOWED_ORIGINS: ${{ inputs.allowed_origins }}
+          SERVICE_NAME: ${{ inputs.render_service || 'finimatic-backend' }}
+          ALLOWED_ORIGINS: ${{ inputs.allowed_origins || 'https://finimatic-frontend.vercel.app,https://finimatic-rossdmello2.netlify.app,https://rossdmello2.github.io' }}
         run: |
           python - <<'PY'
           import json
@@ -169,8 +173,8 @@ jobs:
     env:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       VERCEL_SCOPE: ${{ secrets.VERCEL_SCOPE }}
-      VERCEL_SCOPE_INPUT: ${{ inputs.vercel_scope }}
-      VERCEL_PROJECT: ${{ inputs.vercel_project }}
+      VERCEL_SCOPE_INPUT: ${{ inputs.vercel_scope || 'crce9955ce-8405s-projects' }}
+      VERCEL_PROJECT: ${{ inputs.vercel_project || 'finimatic-frontend' }}
       VITE_API_URL: ${{ needs.create-render-backend.outputs.backend_url }}
     steps:
       - name: Checkout
