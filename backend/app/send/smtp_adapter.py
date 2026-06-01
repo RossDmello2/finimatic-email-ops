@@ -105,7 +105,9 @@ class GmailApiTransport:
             response = client.get(self.profile_url, headers={"Authorization": f"Bearer {token}"})
             response.raise_for_status()
             email_address = str(response.json().get("emailAddress") or "")
-        return not email_address or not user or email_address.lower() == user.lower()
+        if email_address and user and email_address.lower() != user.lower():
+            raise ValueError("Gmail API OAuth account does not match configured sender")
+        return True
 
     def send(self, *, sender: str, password: str, to: str, subject: str, body: str) -> dict:
         del password

@@ -81,3 +81,18 @@ def test_gmail_adapter_reports_provider_verified_for_gmail_api(monkeypatch):
 
     readiness = asyncio.run(adapter.verify("sender@example.com", ""))
     assert readiness == "provider_verified"
+
+
+def test_gmail_api_transport_rejects_oauth_sender_mismatch(monkeypatch):
+    FakeHttpClient.calls = []
+    monkeypatch.setattr(smtp_adapter.httpx, "Client", FakeHttpClient)
+    transport = GmailApiTransport(
+        client_id="client-id",
+        client_secret="client-secret",
+        refresh_token="refresh-token",
+    )
+
+    import pytest
+
+    with pytest.raises(ValueError, match="OAuth account does not match configured sender"):
+        transport.verify("other@example.com", "")
