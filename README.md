@@ -1,4 +1,6 @@
-# Finimatic
+# Finimatic Email Ops
+
+Local-first, human-approved cold email operations with Gmail, AI-assisted drafting, policy gates, reply tracking, follow-ups, and audit logs.
 
 [![CI](https://github.com/RossDmello2/email-automation/actions/workflows/ci.yml/badge.svg)](https://github.com/RossDmello2/email-automation/actions/workflows/ci.yml)
 [![Backend](https://img.shields.io/badge/backend-FastAPI-009688)](https://fastapi.tiangolo.com/)
@@ -6,7 +8,7 @@
 [![Database](https://img.shields.io/badge/database-SQLAlchemy%20%2B%20SQLite%2FPostgreSQL-336791)](https://www.sqlalchemy.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Finimatic is a local-first, human-in-the-loop cold email automation dashboard built with FastAPI, React, Vite, SQLAlchemy, Gmail SMTP/IMAP, Groq, and Gemini. It helps an operator import leads, draft outreach, approve messages, process a policy-gated send queue, track replies, schedule follow-ups, and audit every email operation.
+Finimatic Email Ops is an open-source, self-hosted email operations dashboard built with FastAPI, React, Vite, SQLAlchemy, Gmail SMTP/IMAP, Groq, and Gemini. It helps an operator import leads, draft outreach, approve messages, process a policy-gated send queue, track replies, schedule follow-ups, and audit every email operation.
 
 The project is for developers, technical operators, and maintainers who want to study or self-host a governed email operations workflow. AI can help draft and summarize, but backend code owns credentials, policy checks, audit logs, confirmation gates, and send execution.
 
@@ -14,7 +16,7 @@ The project is for developers, technical operators, and maintainers who want to 
 
 ## Preview
 
-The banner is generated conceptual artwork for README presentation. The product screenshots below it are real sanitized captures from the running app.
+The banner is generated conceptual artwork for README presentation. The product screenshots below it are real sanitized captures from the running app. A GitHub social preview image is prepared at [docs/assets/brand/social-preview.png](docs/assets/brand/social-preview.png).
 
 ![Conceptual Finimatic email operations workflow banner](docs/assets/brand/hero.png)
 
@@ -23,6 +25,10 @@ The banner is generated conceptual artwork for README presentation. The product 
 ![Finimatic replies and stop-state tracking dashboard](docs/assets/screenshots/replies-stops-dashboard.png)
 
 ![Finimatic campaign builder with floating assistant open](docs/assets/screenshots/campaign-assistant.png)
+
+## Why It Exists
+
+Most email automation examples focus on generating copy or sending faster. Finimatic focuses on the operational controls around outreach: review before send, explicit policy gates, reply-aware stop states, canary checks, dry-run mode, and audit trails that make side effects easier to inspect.
 
 ## What It Does
 
@@ -139,6 +145,7 @@ Read more:
 |   |-- DATA_MODEL.md
 |   |-- DEPLOYMENT.md
 |   |-- GETTING_STARTED.md
+|   |-- NAMING_SEO_STRATEGY.md
 |   |-- TESTING.md
 |   |-- TROUBLESHOOTING.md
 |   `-- reference/              # Historical specs, audits, and repair notes
@@ -343,6 +350,7 @@ Read [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) before deploying. It covers enviro
 - [API Reference](docs/API_REFERENCE.md)
 - [Current Data Model](docs/DATA_MODEL.md)
 - [Deployment Guide](docs/DEPLOYMENT.md)
+- [Naming and SEO Strategy](docs/NAMING_SEO_STRATEGY.md)
 - [Testing Guide](docs/TESTING.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Historical Reference Docs](docs/reference/)
