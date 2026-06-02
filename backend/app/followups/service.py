@@ -19,6 +19,8 @@ FOLLOWUP_PLACEHOLDER_RE = re.compile(r"\[[^\]]+\]")
 FOLLOWUP_BANNED_REPLACEMENTS = {
     "I hope you're doing well": "",
     "I hope you are doing well": "",
+    "Hope you're doing well": "",
+    "Hope you are doing well": "",
     "I wanted to follow up": "This is a short note after my previous email",
     "Just checking in": "A quick practical note",
     "leverage": "use",

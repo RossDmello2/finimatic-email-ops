@@ -201,8 +201,26 @@ function apiErrorMessage(error: unknown, fallback: string) {
 
 function App() {
   const [surface, setSurface] = useState<Surface>("setup");
+  const queryClient = useQueryClient();
   const data = useAppData(surface);
   const settings = data.settings.data;
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const oauthStatus = url.searchParams.get("gmail_api_oauth");
+    if (!oauthStatus) return;
+    setSurface("settings");
+    const messages: Record<string, string> = {
+      connected: "gmail_api_connected",
+      connected_unverified: "gmail_api_connected_but_verification_failed",
+      failed: "gmail_api_oauth_failed",
+      refresh_token_missing: "gmail_api_refresh_token_missing"
+    };
+    toast(messages[oauthStatus] ?? oauthStatus);
+    invalidateAll(queryClient);
+    url.searchParams.delete("gmail_api_oauth");
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  }, [queryClient]);
 
   return (
     <div className="app-root bg-[#f4f6f9] text-ink">
@@ -1427,7 +1445,7 @@ function QueuePanel({ queue, contacts, drafts }: { queue: QueueEntry[]; contacts
   const process = useMutation({
     mutationFn: api.processQueue,
     onSuccess: (result) => {
-      toast(`Queue processed: ${result.processed} processed, ${result.sent} sent, ${result.skipped} skipped, ${result.blocked} blocked`);
+      toast(`Queue processed: ${result.processed} processed, ${result.sent} sent, ${result.skipped} skipped, ${result.blocked} blocked, ${result.deferred ?? 0} deferred`);
       invalidateAll(queryClient);
     }
   });
@@ -2216,6 +2234,9 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
   const [dailyCap, setDailyCap] = useState(settings?.daily_send_cap ?? 50);
   const [hourlyCap, setHourlyCap] = useState(settings?.hourly_send_cap ?? 10);
   const [delay, setDelay] = useState(settings?.send_delay_s ?? 60);
+  const [autoProcessEnabled, setAutoProcessEnabled] = useState(settings?.auto_process_enabled ?? true);
+  const [autoProcessQueueInterval, setAutoProcessQueueInterval] = useState(settings?.auto_process_queue_interval_seconds ?? 5);
+  const [autoProcessFollowupInterval, setAutoProcessFollowupInterval] = useState(settings?.auto_process_followup_interval_seconds ?? 60);
   const [followupDays, setFollowupDays] = useState(settings?.followup_interval_days ?? 3);
   const [maxFollowups, setMaxFollowups] = useState(settings?.max_followups_per_lead ?? 2);
   const [campaignContext, setCampaignContext] = useState(settings?.campaign_context ?? "");
@@ -2248,6 +2269,9 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
     setDailyCap(settings.daily_send_cap);
     setHourlyCap(settings.hourly_send_cap);
     setDelay(settings.send_delay_s);
+    setAutoProcessEnabled(settings.auto_process_enabled ?? true);
+    setAutoProcessQueueInterval(settings.auto_process_queue_interval_seconds ?? 5);
+    setAutoProcessFollowupInterval(settings.auto_process_followup_interval_seconds ?? 60);
     setFollowupDays(settings.followup_interval_days);
     setMaxFollowups(settings.max_followups_per_lead);
     setCampaignContext(settings.campaign_context);
@@ -2295,6 +2319,9 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
     daily_send_cap: dailyCap,
     hourly_send_cap: hourlyCap,
     send_delay_s: delay,
+    auto_process_enabled: autoProcessEnabled,
+    auto_process_queue_interval_seconds: autoProcessQueueInterval,
+    auto_process_followup_interval_seconds: autoProcessFollowupInterval,
     followup_interval_days: followupDays,
     max_followups_per_lead: maxFollowups,
     campaign_context: campaignContext,
@@ -2352,16 +2379,31 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
     },
     onError: (error) => toast(apiErrorMessage(error, "settings save and email verification failed"))
   });
+  const connectGmailApi = useMutation({
+    mutationFn: async () => {
+      await api.updateSettings(payload());
+      return api.startGmailApiOAuth({ return_url: `${window.location.origin}${window.location.pathname}` });
+    },
+    onSuccess: (result) => {
+      window.location.assign(result.authorization_url);
+    },
+    onError: (error) => toast(apiErrorMessage(error, "gmail api oauth start failed"))
+  });
   return (
     <Panel
       title="Settings"
       icon={Settings}
       action={
         <div className="flex gap-2">
-          <button className={`button secondary${saveVerify.isPending ? " is-loading" : ""}`} disabled={saveVerify.isPending || save.isPending} aria-busy={saveVerify.isPending} onClick={() => saveVerify.mutate()}>
+          {emailTransport === "gmail_api" && (
+            <button className={`button secondary${connectGmailApi.isPending ? " is-loading" : ""}`} disabled={saveVerify.isPending || save.isPending || connectGmailApi.isPending} aria-busy={connectGmailApi.isPending} onClick={() => connectGmailApi.mutate()}>
+              <KeyRound className={connectGmailApi.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{connectGmailApi.isPending ? "Connecting..." : "Connect Gmail API"}</span>
+            </button>
+          )}
+          <button className={`button secondary${saveVerify.isPending ? " is-loading" : ""}`} disabled={saveVerify.isPending || save.isPending || connectGmailApi.isPending} aria-busy={saveVerify.isPending} onClick={() => saveVerify.mutate()}>
             <Check className={saveVerify.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{saveVerify.isPending ? "Verifying..." : "Save & Verify Email"}</span>
           </button>
-          <button className={`button primary${save.isPending ? " is-loading" : ""}`} disabled={save.isPending || saveVerify.isPending} onClick={() => save.mutate()}>
+          <button className={`button primary${save.isPending ? " is-loading" : ""}`} disabled={save.isPending || saveVerify.isPending || connectGmailApi.isPending} onClick={() => save.mutate()}>
             <KeyRound className={save.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{save.isPending ? "Saving..." : "Save"}</span>
           </button>
         </div>
@@ -2377,11 +2419,16 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
             <label>Gmail API Client ID<input type="password" value={gmailApiClientId} onChange={(e) => setGmailApiClientId(e.target.value)} placeholder={settings?.gmail_api_configured ? "configured" : ""} /></label>
             <label>Gmail API Client Secret<input type="password" value={gmailApiClientSecret} onChange={(e) => setGmailApiClientSecret(e.target.value)} placeholder={settings?.gmail_api_configured ? "configured" : ""} /></label>
             <label>Gmail API Refresh Token<input type="password" value={gmailApiRefreshToken} onChange={(e) => setGmailApiRefreshToken(e.target.value)} placeholder={settings?.gmail_api_configured ? "configured" : ""} /></label>
+            <div className="notice">
+              Hosted Gmail sends use Google OAuth. SMTP/IMAP app passwords are not used by Gmail API.
+            </div>
           </>
         )}
         <label>Daily Cap<input type="number" value={dailyCap} onChange={(e) => setDailyCap(Number(e.target.value))} /></label>
         <label>Hourly Cap<input type="number" value={hourlyCap} onChange={(e) => setHourlyCap(Number(e.target.value))} /></label>
         <label>Send Delay<input type="number" value={delay} onChange={(e) => setDelay(Number(e.target.value))} /></label>
+        <label>Queue Check Interval<input type="number" min={5} value={autoProcessQueueInterval} disabled={!autoProcessEnabled} onChange={(e) => setAutoProcessQueueInterval(Number(e.target.value))} /></label>
+        <label>Follow-up Check Interval<input type="number" min={30} value={autoProcessFollowupInterval} disabled={!autoProcessEnabled} onChange={(e) => setAutoProcessFollowupInterval(Number(e.target.value))} /></label>
         <label>Follow-up Days<input type="number" value={followupDays} onChange={(e) => setFollowupDays(Number(e.target.value))} /></label>
         <label>Max Follow-ups<input type="number" value={maxFollowups} onChange={(e) => setMaxFollowups(Number(e.target.value))} /></label>
         <label>IMAP Fetch Interval (minutes)<input type="number" min={1} value={imapInterval} onChange={(e) => setImapInterval(Number(e.target.value))} /></label>
@@ -2460,6 +2507,7 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
         </div>
       </div>
       <div className="mt-4 flex flex-wrap gap-4">
+        <label className="toggle"><input type="checkbox" checked={autoProcessEnabled} onChange={(e) => setAutoProcessEnabled(e.target.checked)} /> Auto Process Queue</label>
         <label className="toggle"><input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} /> Dry run</label>
         <label className="toggle"><input type="checkbox" checked={warmUpMode} onChange={(e) => setWarmUpMode(e.target.checked)} /> Warm-up Mode</label>
         {warmUpMode && <span className="fingerprint">Ramp limit: {settings?.warm_up_current_limit ?? dailyCap}/day</span>}

@@ -7,7 +7,7 @@ import time
 import uuid
 from datetime import timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -21,6 +21,7 @@ from app.core.idempotency import sha256_key
 from app.core.time import iso, utcnow
 from app.db.models import Contact, Draft, SendQueue
 from app.db.session import SessionLocal, get_db
+from app.send.auto_process import schedule_auto_process
 from app.send.queue_worker import create_queue_entry
 from app.settings.service import get_int, get_key_list, get_value
 
@@ -307,7 +308,7 @@ def _run_bulk_generation(job_id: str, payload: BulkDraftGenerate) -> None:
 
 
 @router.post("/approve-bulk")
-def approve_bulk(payload: BulkApprove, db: Session = Depends(get_db)):
+def approve_bulk(payload: BulkApprove, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     approved = 0
     queued = 0
     for draft_id in payload.draft_ids:
@@ -326,6 +327,8 @@ def approve_bulk(payload: BulkApprove, db: Session = Depends(get_db)):
         emit_event(db, "draft.approved", entity_type="draft", entity_id=draft.id, payload={"queue_id": queue.id})
         queued += 1
     db.commit()
+    if queued:
+        schedule_auto_process(background_tasks)
     return {"approved": approved, "queued": queued}
 
 
@@ -346,7 +349,7 @@ async def subject_variants(draft_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{draft_id}/approve")
-def approve_draft(draft_id: str, payload: DraftApprove | None = None, db: Session = Depends(get_db)):
+def approve_draft(draft_id: str, background_tasks: BackgroundTasks, payload: DraftApprove | None = None, db: Session = Depends(get_db)):
     draft = db.get(Draft, draft_id)
     if not draft:
         raise HTTPException(status_code=404, detail="draft not found")
@@ -362,4 +365,5 @@ def approve_draft(draft_id: str, payload: DraftApprove | None = None, db: Sessio
     queue = _queue_approved_draft(db, draft, contact, sequence_num)
     emit_event(db, "draft.approved", entity_type="draft", entity_id=draft.id, payload={"queue_id": queue.id, "sequence_num": sequence_num})
     db.commit()
+    schedule_auto_process(background_tasks)
     return {**draft_to_dict(draft), "queue_id": queue.id}

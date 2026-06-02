@@ -14,5 +14,9 @@ services:
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false
+      - key: FRONTEND_URL
+        value: https://finimatic-frontend.vercel.app/
+      - key: GMAIL_OAUTH_REDIRECT_URI
+        value: https://finimatic-backend.onrender.com/api/settings/gmail-api/oauth/callback
       - key: FINIMATIC_DISABLE_SCHEDULER
         value: "0"

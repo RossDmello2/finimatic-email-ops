@@ -884,7 +884,7 @@ def test_queue_worker_skips_entries_claimed_by_another_worker(client):
     assert len(client.app.state.transport.sent) == 0
 
 
-def test_send_window_closed_records_visible_policy_block(client):
+def test_send_window_closed_defers_without_permanent_block(client):
     configure_sender(client, canary_verified=True, dry_run=False)
     now = datetime.now(timezone.utc)
     start = (now + timedelta(hours=2)).strftime("%H:%M")
@@ -898,7 +898,8 @@ def test_send_window_closed_records_visible_policy_block(client):
     checked = client.get(f"/api/queue/{entry['id']}").json()
 
     assert processed["processed"] == 1
-    assert checked["status"] == "blocked"
+    assert processed["deferred"] == 1
+    assert checked["status"] == "pending"
     assert "SEND_WINDOW_NOT_ELAPSED" in checked["policy_block_reasons"]
 
 

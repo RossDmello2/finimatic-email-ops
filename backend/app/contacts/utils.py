@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
@@ -136,7 +136,7 @@ def resolve_tokens(text: str, contact: Contact) -> str:
     return TOKEN_RE.sub(replace, text or "")
 
 
-def send_window_open(db: Session, now: datetime | None = None) -> bool:
+def _send_window_parts(db: Session) -> tuple[time | None, time | None, ZoneInfo]:
     start = get_value(db, "send_window_start", "09:00") or "09:00"
     end = get_value(db, "send_window_end", "17:00") or "17:00"
     tz_name = get_value(db, "send_timezone", "Asia/Kolkata") or "Asia/Kolkata"
@@ -144,12 +144,33 @@ def send_window_open(db: Session, now: datetime | None = None) -> bool:
         zone = ZoneInfo(tz_name)
     except ZoneInfoNotFoundError:
         zone = ZoneInfo("UTC")
-    local_now = (now or datetime.now(timezone.utc)).astimezone(zone).time()
     try:
         start_time = datetime.strptime(start, "%H:%M").time()
         end_time = datetime.strptime(end, "%H:%M").time()
     except ValueError:
+        return None, None, zone
+    return start_time, end_time, zone
+
+
+def send_window_open(db: Session, now: datetime | None = None) -> bool:
+    start_time, end_time, zone = _send_window_parts(db)
+    if start_time is None or end_time is None:
         return True
+    local_now = (now or datetime.now(timezone.utc)).astimezone(zone).time()
     if start_time <= end_time:
         return start_time <= local_now <= end_time
     return local_now >= start_time or local_now <= end_time
+
+
+def next_send_window_open_at(db: Session, now: datetime | None = None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    start_time, end_time, zone = _send_window_parts(db)
+    if start_time is None or end_time is None or send_window_open(db, current):
+        return current
+
+    local_now = current.astimezone(zone)
+    if start_time <= end_time:
+        target_date = local_now.date() if local_now.time() < start_time else local_now.date() + timedelta(days=1)
+    else:
+        target_date = local_now.date()
+    return datetime.combine(target_date, start_time, tzinfo=zone).astimezone(timezone.utc)
