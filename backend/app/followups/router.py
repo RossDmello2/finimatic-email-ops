@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -8,6 +8,7 @@ from app.core.time import parse_datetime
 from app.db.models import FollowUpSequence
 from app.db.session import get_db
 from app.followups.service import approve_followup_draft, followup_to_dict, process_due_followups
+from app.send.auto_process import schedule_auto_process
 
 router = APIRouter(prefix="/api/followups", tags=["followups"])
 
@@ -48,9 +49,11 @@ def patch_followup(sequence_id: str, payload: FollowUpPatch, db: Session = Depen
 
 
 @router.post("/{sequence_id}/approve-draft")
-def approve_draft(sequence_id: str, db: Session = Depends(get_db)):
+def approve_draft(sequence_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     try:
-        return approve_followup_draft(db, sequence_id)
+        result = approve_followup_draft(db, sequence_id)
+        schedule_auto_process(background_tasks)
+        return result
     except ValueError as exc:
         code = str(exc)
         status_code = 404 if code in {"followup_not_found", "draft_not_found"} else 409

@@ -375,6 +375,7 @@ def test_followup_process_proposes_unapproved_draft(client):
         assert "[" not in draft.body
         assert "I wanted to follow up" not in draft.body
         assert "I hope" not in draft.body
+        assert "hope you're doing well" not in draft.body.lower()
         assert "Ross Dmello" in draft.body
         assert "AI Systems Engineer" in draft.body
 

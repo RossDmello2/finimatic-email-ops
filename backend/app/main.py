@@ -23,6 +23,7 @@ from app.provider_health.router import router as provider_health_router
 from app.replies.router import router as replies_router
 from app.replies.imap_fetcher import run_imap_fetch_with_lock
 from app.send.canary_router import router as canary_router
+from app.send.auto_process import auto_process_enabled, auto_process_interval_seconds
 from app.send.router import router as queue_router
 from app.send.queue_worker import process_pending_queue
 from app.send.smtp_adapter import default_transport
@@ -37,22 +38,28 @@ logger = logging.getLogger(__name__)
 
 async def _periodic_queue_worker() -> None:
     while True:
-        await asyncio.sleep(30)
+        interval = 5
         try:
             with SessionLocal() as db:
-                await process_pending_queue(db)
+                interval = auto_process_interval_seconds(db, "queue")
+                if auto_process_enabled(db):
+                    await process_pending_queue(db)
         except Exception:
             logger.exception("queue worker iteration failed")
+        await asyncio.sleep(interval)
 
 
 async def _periodic_followup_worker() -> None:
     while True:
-        await asyncio.sleep(300)
+        interval = 60
         try:
             with SessionLocal() as db:
-                process_due_followups(db)
+                interval = auto_process_interval_seconds(db, "followups")
+                if auto_process_enabled(db):
+                    process_due_followups(db)
         except Exception:
             logger.exception("follow-up worker iteration failed")
+        await asyncio.sleep(interval)
 
 
 def _scheduled_imap_reply_fetch() -> None:

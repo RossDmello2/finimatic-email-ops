@@ -33,6 +33,8 @@ export const api = {
     request<SettingsRead>("/api/settings", { method: "POST", body: JSON.stringify(payload) }),
   verifyEmail: () => request<{ readiness: string; error_code?: string }>("/api/settings/verify-email", { method: "POST" }),
   verifySmtp: () => request<{ readiness: string; error_code?: string }>("/api/settings/verify-smtp", { method: "POST" }),
+  startGmailApiOAuth: (payload: { return_url?: string }) =>
+    request<GmailApiOAuthStart>("/api/settings/gmail-api/oauth/start", { method: "POST", body: JSON.stringify(payload) }),
   sendCanary: () => request<CanaryResult>("/api/canary/send", { method: "POST" }),
   listProviderHealth: () => request<ListResponse<ProviderHealth>>("/api/provider-health"),
   previewImport: (payload: Record<string, unknown>) =>
@@ -70,7 +72,7 @@ export const api = {
   createTemplate: (payload: Record<string, unknown>) =>
     request<TemplateRow>("/api/templates", { method: "POST", body: JSON.stringify(payload) }),
   listQueue: () => request<ListResponse<QueueEntry>>("/api/queue"),
-  processQueue: () => request<{ processed: number; sent: number; blocked: number; skipped: number }>("/api/queue/process", { method: "POST" }),
+  processQueue: () => request<{ processed: number; sent: number; blocked: number; skipped: number; deferred?: number }>("/api/queue/process", { method: "POST" }),
   listFollowups: () => request<ListResponse<Followup>>("/api/followups"),
   processFollowups: () => request<{ processed: number; stopped: number; dispatched: number; skipped: number }>("/api/followups/process", { method: "POST" }),
   approveFollowupDraft: (id: string) => request<{ status: string; queue_id: string }>(`/api/followups/${id}/approve-draft`, { method: "POST" }),
@@ -125,6 +127,9 @@ export type SettingsRead = {
   daily_send_cap: number;
   hourly_send_cap: number;
   send_delay_s: number;
+  auto_process_enabled: boolean;
+  auto_process_queue_interval_seconds: number;
+  auto_process_followup_interval_seconds: number;
   followup_interval_days: number;
   max_followups_per_lead: number;
   campaign_context: string;
@@ -163,6 +168,12 @@ export type CanaryResult = {
   sender_identity?: string;
   message_id?: string;
   previous_attempt_id?: string;
+};
+
+export type GmailApiOAuthStart = {
+  authorization_url: string;
+  redirect_uri: string;
+  scopes: string[];
 };
 
 export type ListResponse<T> = { items: T[]; total: number };

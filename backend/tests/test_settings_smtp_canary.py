@@ -35,6 +35,9 @@ def test_settings_encrypts_secrets_and_returns_only_fingerprints(client):
             "send_timezone": "Asia/Kolkata",
             "warm_up_mode": True,
             "imap_fetch_interval_minutes": 7,
+            "auto_process_enabled": False,
+            "auto_process_queue_interval_seconds": 9,
+            "auto_process_followup_interval_seconds": 90,
             "groq_keys": f"{key}\ngroq-test-two",
             "gemini_keys": "gemini-test-one",
         },
@@ -57,6 +60,9 @@ def test_settings_encrypts_secrets_and_returns_only_fingerprints(client):
     assert body["warm_up_mode"] is True
     assert body["warm_up_current_limit"] == 5
     assert body["imap_fetch_interval_minutes"] == 7
+    assert body["auto_process_enabled"] is False
+    assert body["auto_process_queue_interval_seconds"] == 9
+    assert body["auto_process_followup_interval_seconds"] == 90
     assert body["email_transport"] == "gmail_api"
     assert body["gmail_api_configured"] is True
 

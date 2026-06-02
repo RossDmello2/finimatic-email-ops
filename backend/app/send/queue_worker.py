@@ -1,19 +1,21 @@
 from __future__ import annotations
 
 import json
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit.service import emit_event
-from app.contacts.utils import resolve_tokens
+from app.contacts.utils import next_send_window_open_at, resolve_tokens
 from app.core.idempotency import sha256_key
 from app.core.time import utcnow
 from app.db.models import Contact, ConversationMessage, Draft, FollowUpSequence, SendAttempt, SendQueue
 from app.send.policy import evaluate_policy, store_policy_result
 from app.send.smtp_adapter import GmailAdapter
 from app.settings.service import get_bool, get_int, get_secret, get_value
+
+TEMPORARY_BLOCK_REASONS = {"SEND_WINDOW_NOT_ELAPSED"}
 
 
 def queue_to_dict(entry: SendQueue) -> dict:
@@ -67,6 +69,40 @@ def create_queue_entry(db: Session, contact_id: str, draft_id: str, sequence_num
     return entry
 
 
+def _temporary_block_only(reasons: list[str]) -> bool:
+    return bool(reasons) and set(reasons).issubset(TEMPORARY_BLOCK_REASONS)
+
+
+def _aware_utc(value):
+    if value is None:
+        return None
+    if getattr(value, "tzinfo", None) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _next_retry_at(db: Session, now) -> object:
+    retry_at = now + timedelta(seconds=5)
+    window_at = next_send_window_open_at(db, now)
+    if window_at > retry_at:
+        retry_at = window_at
+
+    send_delay_s = get_int(db, "send_delay_s")
+    if send_delay_s > 0:
+        last_success = (
+            db.query(SendAttempt)
+            .filter(SendAttempt.status == "success", SendAttempt.sent_at.is_not(None))
+            .order_by(SendAttempt.sent_at.desc())
+            .first()
+        )
+        last_sent_at = _aware_utc(last_success.sent_at) if last_success else None
+        if last_sent_at:
+            delay_at = last_sent_at + timedelta(seconds=send_delay_s)
+            if delay_at > retry_at:
+                retry_at = delay_at
+    return retry_at
+
+
 async def process_pending_queue(db: Session, transport=None) -> dict:
     now = utcnow()
     entries = (
@@ -79,6 +115,7 @@ async def process_pending_queue(db: Session, transport=None) -> dict:
     sent = 0
     blocked = 0
     skipped = 0
+    deferred = 0
     adapter = GmailAdapter.from_settings(db, transport=transport)
 
     for entry in entries:
@@ -99,6 +136,19 @@ async def process_pending_queue(db: Session, transport=None) -> dict:
         store_policy_result(entry, decision)
         emit_event(db, "queue.policy_evaluated", entity_type="send_queue", entity_id=entry.id, payload={"reasons": decision.block_reason_codes})
         if not decision.all_passed:
+            if _temporary_block_only(decision.block_reason_codes):
+                entry.status = "pending"
+                entry.scheduled_at = _next_retry_at(db, now)
+                emit_event(
+                    db,
+                    "queue.temporarily_deferred",
+                    entity_type="send_queue",
+                    entity_id=entry.id,
+                    payload={"reasons": decision.block_reason_codes, "retry_at": entry.scheduled_at.isoformat()},
+                )
+                deferred += 1
+                db.commit()
+                continue
             entry.status = "blocked"
             entry.contact.status = "blocked_by_policy"
             emit_event(db, "queue.gate_blocked", entity_type="send_queue", entity_id=entry.id, payload={"reasons": decision.block_reason_codes})
@@ -180,7 +230,7 @@ async def process_pending_queue(db: Session, transport=None) -> dict:
             )
             emit_event(db, "send.failed", entity_type="send_queue", entity_id=entry.id, payload={"error_code": result.error_code})
         db.commit()
-    return {"processed": processed, "sent": sent, "blocked": blocked, "skipped": skipped}
+    return {"processed": processed, "sent": sent, "blocked": blocked, "skipped": skipped, "deferred": deferred}
 
 
 def _schedule_followup(db: Session, contact_id: str, draft_id: str, sent_at, sequence_num: int = 2) -> None:
