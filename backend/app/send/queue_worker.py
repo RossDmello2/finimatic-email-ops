@@ -19,15 +19,13 @@ TEMPORARY_BLOCK_REASONS = {"SEND_WINDOW_NOT_ELAPSED"}
 DRY_RUN_REASON = "DRY_RUN_ENABLED"
 
 
-def _latest_attempt_dict(db: Session, entry_id: str) -> dict:
-    attempt = (
-        db.query(SendAttempt)
-        .filter(SendAttempt.queue_id == entry_id)
-        .order_by(SendAttempt.sent_at.desc().nullslast(), SendAttempt.id.desc())
-        .first()
-    )
+def _empty_latest_attempt_dict() -> dict:
+    return {"last_attempt_status": None, "last_attempt_error_code": None, "last_attempt_error_detail": None}
+
+
+def _attempt_to_dict(attempt: SendAttempt | None) -> dict:
     if not attempt:
-        return {"last_attempt_status": None, "last_attempt_error_code": None, "last_attempt_error_detail": None}
+        return _empty_latest_attempt_dict()
     return {
         "last_attempt_status": attempt.status,
         "last_attempt_error_code": attempt.error_code,
@@ -35,7 +33,33 @@ def _latest_attempt_dict(db: Session, entry_id: str) -> dict:
     }
 
 
-def queue_to_dict(entry: SendQueue, db: Session | None = None) -> dict:
+def _latest_attempt_dict(db: Session, entry_id: str) -> dict:
+    attempt = (
+        db.query(SendAttempt)
+        .filter(SendAttempt.queue_id == entry_id)
+        .order_by(SendAttempt.sent_at.desc().nullslast(), SendAttempt.id.desc())
+        .first()
+    )
+    return _attempt_to_dict(attempt)
+
+
+def latest_attempts_by_queue(db: Session, entry_ids: list[str]) -> dict[str, dict]:
+    if not entry_ids:
+        return {}
+    attempts = (
+        db.query(SendAttempt)
+        .filter(SendAttempt.queue_id.in_(entry_ids))
+        .order_by(SendAttempt.queue_id.asc(), SendAttempt.sent_at.desc().nullslast(), SendAttempt.id.desc())
+        .all()
+    )
+    latest: dict[str, dict] = {}
+    for attempt in attempts:
+        if attempt.queue_id not in latest:
+            latest[attempt.queue_id] = _attempt_to_dict(attempt)
+    return latest
+
+
+def queue_to_dict(entry: SendQueue, db: Session | None = None, latest_attempt: dict | None = None) -> dict:
     contact = entry.contact
     draft = entry.draft
     payload = {
@@ -52,9 +76,17 @@ def queue_to_dict(entry: SendQueue, db: Session | None = None) -> dict:
         "policy_block_reasons": json.loads(entry.policy_block_reasons or "[]"),
         "created_at": entry.created_at.isoformat() if entry.created_at else None,
     }
-    if db is not None:
+    if latest_attempt is not None:
+        payload.update(latest_attempt)
+    elif db is not None:
         payload.update(_latest_attempt_dict(db, entry.id))
     return payload
+
+
+def queue_list_to_dict(entries: list[SendQueue], db: Session) -> list[dict]:
+    latest = latest_attempts_by_queue(db, [entry.id for entry in entries])
+    empty = _empty_latest_attempt_dict()
+    return [queue_to_dict(entry, latest_attempt=latest.get(entry.id, empty)) for entry in entries]
 
 
 def create_queue_entry(db: Session, contact_id: str, draft_id: str, sequence_num: int = 1) -> SendQueue:

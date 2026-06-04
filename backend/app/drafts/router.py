@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from datetime import timedelta
+from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
@@ -17,9 +18,10 @@ from app.ai.gemini_pool import GEMINI_MODEL_DEFAULT
 from app.ai.prompts import sender_profile_from_settings
 from app.ai.schema import AIFailure, DraftSuggestion
 from app.audit.service import emit_event
+from app.contacts.utils import resolve_tokens
 from app.core.idempotency import sha256_key
 from app.core.time import iso, utcnow
-from app.db.models import Contact, Draft, SendQueue
+from app.db.models import Contact, Draft, SendQueue, Template
 from app.db.session import SessionLocal, get_db
 from app.send.auto_process import schedule_auto_process
 from app.send.queue_worker import create_queue_entry, process_pending_queue, queue_to_dict
@@ -49,6 +51,9 @@ class BulkDraftGenerate(BaseModel):
     contact_ids: list[str]
     provider: str = "auto"
     tone: str | None = None
+    template_id: str | None = None
+    instruction: str | None = None
+    mode: Literal["ai_only", "template_only", "template_plus_ai"] = "ai_only"
 
 
 class BulkApprove(BaseModel):
@@ -128,6 +133,28 @@ def store_generated_draft(
     contact.status = "draft_ready" if not error_code else "draft_needed"
     db.flush()
     return draft
+
+
+def _resolved_template_suggestion(template: Template, contact: Contact, warnings: list[str] | None = None) -> DraftSuggestion | AIFailure:
+    subject = resolve_tokens(template.subject_template, contact).strip()
+    body = resolve_tokens(template.body_template, contact).strip()
+    if not subject or len(body) < 10:
+        return AIFailure(error_code="template_invalid", provider="template", detail="empty_subject_or_body")
+    return DraftSuggestion(subject=subject[:200], body=body[:5000], warnings=warnings or [])
+
+
+def _template_plus_ai_instruction(template: Template, contact: Contact, operator_instruction: str | None) -> str:
+    subject = resolve_tokens(template.subject_template, contact).strip()
+    body = resolve_tokens(template.body_template, contact).strip()
+    extra = " ".join((operator_instruction or "").split())[:300]
+    parts = [
+        f"Additional operator instruction: {extra or 'none'}",
+        "Use this resolved template as the required structure. Keep the same sections and call-to-action.",
+        "Personalize only with known contact fields and operator notes. Do not invent facts.",
+        f"Template subject: {subject}",
+        f"Template body: {body}",
+    ]
+    return "\n".join(parts)[:1200]
 
 
 def _queue_approved_draft(db: Session, draft: Draft, contact: Contact, sequence_num: int = 1, *, immediate: bool = False) -> SendQueue:
@@ -273,7 +300,12 @@ async def generate_draft(payload: DraftGenerate, db: Session = Depends(get_db)):
 
 
 @router.post("/generate-bulk")
-def generate_bulk(payload: BulkDraftGenerate):
+def generate_bulk(payload: BulkDraftGenerate, db: Session = Depends(get_db)):
+    if payload.mode in {"template_only", "template_plus_ai"}:
+        if not payload.template_id:
+            raise HTTPException(status_code=422, detail="template_id is required for template bulk mode")
+        if not db.get(Template, payload.template_id):
+            raise HTTPException(status_code=404, detail="template not found")
     job_id = uuid.uuid4().hex
     BULK_JOBS[job_id] = {
         "job_id": job_id,
@@ -284,6 +316,7 @@ def generate_bulk(payload: BulkDraftGenerate):
         "failed": 0,
         "skipped": 0,
         "errors": [],
+        "mode": payload.mode,
     }
     thread = threading.Thread(target=_run_bulk_generation, args=(job_id, payload), daemon=True)
     thread.start()
@@ -303,6 +336,7 @@ def _run_bulk_generation(job_id: str, payload: BulkDraftGenerate) -> None:
     with SessionLocal() as db:
         gateway = build_gateway(db)
         tone = payload.tone or get_value(db, "sender_tone", "Professional")
+        template = db.get(Template, payload.template_id) if payload.template_id else None
         for contact_id in payload.contact_ids:
             try:
                 contact = db.get(Contact, contact_id)
@@ -313,25 +347,64 @@ def _run_bulk_generation(job_id: str, payload: BulkDraftGenerate) -> None:
                 if existing:
                     job["skipped"] += 1
                     continue
-                result = asyncio.run(gateway.generate_draft(contact, payload.provider, tone, "medium"))
-                if isinstance(result, AIFailure):
-                    suggestion = DraftSuggestion.model_construct(subject="", body="", warnings=[])
-                    store_generated_draft(db, contact, payload.provider, gateway, suggestion, result.error_code)
-                    emit_event(
-                        db,
-                        "draft.ai_failed",
-                        entity_type="contact",
-                        entity_id=contact.id,
-                        payload={"provider": result.provider, "error_code": result.error_code},
-                    )
-                    job["failed"] += 1
+                if payload.mode in {"template_only", "template_plus_ai"} and template is None:
+                    raise RuntimeError("template_missing")
+
+                if payload.mode == "template_only":
+                    result = _resolved_template_suggestion(template, contact)  # type: ignore[arg-type]
+                    provider = "template"
                 else:
-                    draft = store_generated_draft(db, contact, payload.provider, gateway, result)
-                    event_payload = {"provider": payload.provider}
-                    model = provider_model(gateway, payload.provider)
-                    if model:
-                        event_payload["model"] = model
-                    emit_event(db, "draft.ai_generated", entity_type="contact", entity_id=contact.id, payload=event_payload)
+                    instruction = payload.instruction
+                    if payload.mode == "template_plus_ai":
+                        instruction = _template_plus_ai_instruction(template, contact, payload.instruction)  # type: ignore[arg-type]
+                    result = asyncio.run(gateway.generate_draft(contact, payload.provider, tone, "medium", instruction))
+                    provider = payload.provider
+
+                if isinstance(result, AIFailure):
+                    if payload.mode == "template_plus_ai" and template is not None:
+                        fallback = _resolved_template_suggestion(
+                            template,
+                            contact,
+                            warnings=[f"AI personalization failed ({result.error_code}); used resolved template."],
+                        )
+                        if isinstance(fallback, AIFailure):
+                            store_generated_draft(db, contact, payload.provider, gateway, DraftSuggestion.model_construct(subject="", body="", warnings=[]), fallback.error_code)
+                            job["failed"] += 1
+                        else:
+                            draft = store_generated_draft(db, contact, "template", gateway, fallback)
+                            emit_event(
+                                db,
+                                "draft.template_generated",
+                                entity_type="draft",
+                                entity_id=draft.id,
+                                payload={"template_id": template.id, "mode": payload.mode, "ai_error_code": result.error_code},
+                            )
+                            job["generated"] += 1
+                            job["errors"].append(result.error_code)
+                    else:
+                        suggestion = DraftSuggestion.model_construct(subject="", body="", warnings=[])
+                        store_generated_draft(db, contact, provider, gateway, suggestion, result.error_code)
+                        emit_event(
+                            db,
+                            "draft.ai_failed",
+                            entity_type="contact",
+                            entity_id=contact.id,
+                            payload={"provider": result.provider, "error_code": result.error_code},
+                        )
+                        job["failed"] += 1
+                else:
+                    draft = store_generated_draft(db, contact, provider, gateway, result)
+                    if provider == "template":
+                        event_payload = {"template_id": template.id if template else None, "mode": payload.mode}
+                        emit_event(db, "draft.template_generated", entity_type="draft", entity_id=draft.id, payload=event_payload)
+                    else:
+                        event_payload = {"provider": payload.provider, "mode": payload.mode}
+                        model = provider_model(gateway, payload.provider)
+                        if model:
+                            event_payload["model"] = model
+                        if template:
+                            event_payload["template_id"] = template.id
+                        emit_event(db, "draft.ai_generated", entity_type="contact", entity_id=contact.id, payload=event_payload)
                     job["generated"] += 1
                 db.commit()
                 if payload.provider == "groq":

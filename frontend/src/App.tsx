@@ -74,6 +74,7 @@ const surfaces = [
 ] as const;
 
 type Surface = (typeof surfaces)[number][0];
+type BulkDraftMode = "ai_only" | "template_only" | "template_plus_ai";
 
 function useAppData(surface: Surface) {
   const repliesVisible = surface === "replies";
@@ -285,7 +286,7 @@ function App() {
           {surface === "setup" && <SetupPanel settings={settings} />}
           {surface === "health" && <HealthPanel settings={settings} providerHealth={data.providerHealth.data?.items ?? []} />}
           {surface === "import" && <ImportPanel contactsTotal={data.contacts.data?.total ?? 0} />}
-          {surface === "contacts" && <ContactsPanel contacts={data.contacts.data?.items ?? []} recentlyDeletedContacts={data.recentlyDeletedContacts.data?.items ?? []} settings={settings} navigate={setSurface} />}
+          {surface === "contacts" && <ContactsPanel contacts={data.contacts.data?.items ?? []} recentlyDeletedContacts={data.recentlyDeletedContacts.data?.items ?? []} templates={data.templates.data?.items ?? []} settings={settings} navigate={setSurface} />}
           {surface === "drafts" && <DraftsPanel contacts={data.contacts.data?.items ?? []} drafts={data.drafts.data?.items ?? []} templates={data.templates.data?.items ?? []} queue={data.queue.data?.items ?? []} />}
           {surface === "templates" && <TemplatesPanel templates={data.templates.data?.items ?? []} />}
           {surface === "campaigns" && <CampaignsPanel campaigns={data.campaigns.data?.items ?? []} contacts={data.contacts.data?.items ?? []} navigate={setSurface} />}
@@ -597,11 +598,13 @@ function deletionWindowText(deletedAt?: string | null) {
 function ContactsPanel({
   contacts,
   recentlyDeletedContacts,
+  templates,
   settings,
   navigate
 }: {
   contacts: Contact[];
   recentlyDeletedContacts: Contact[];
+  templates: TemplateRow[];
   settings?: SettingsRead;
   navigate: (surface: Surface) => void;
 }) {
@@ -612,7 +615,10 @@ function ContactsPanel({
   const [bulkProvider, setBulkProvider] = useState("groq");
   const [bulkTone, setBulkTone] = useState(settings?.sender_tone ?? "Professional");
   const [bulkTag, setBulkTag] = useState("");
-  const [bulkJob, setBulkJob] = useState<{ job_id: string; status: string; total: number; completed: number; generated: number; failed: number; skipped: number } | null>(null);
+  const [bulkMode, setBulkMode] = useState<BulkDraftMode>("ai_only");
+  const [bulkTemplateId, setBulkTemplateId] = useState("");
+  const [bulkInstruction, setBulkInstruction] = useState("");
+  const [bulkJob, setBulkJob] = useState<{ job_id: string; status: string; total: number; completed: number; generated: number; failed: number; skipped: number; mode?: string; errors?: string[] } | null>(null);
   const [selectedContactIds, setSelectedContactIds] = useState<string[]>([]);
   const [deleteConfirmContacts, setDeleteConfirmContacts] = useState<Contact[]>([]);
   useEffect(() => {
@@ -625,9 +631,17 @@ function ContactsPanel({
   const bulkDraftStatuses = new Set(["imported", "draft_needed", "draft_ready"]);
   const draftableContacts = contacts.filter((contact) => bulkDraftStatuses.has(contact.status));
   const selectedDraftableContacts = selectedContacts.filter((contact) => bulkDraftStatuses.has(contact.status));
+  const selectedExcludedCount = Math.max(0, selectedContacts.length - selectedDraftableContacts.length);
   const bulkSourceContacts = selectedDraftableContacts.length ? selectedDraftableContacts : draftableContacts;
   const bulkContacts = bulkSourceContacts.filter((contact) => !bulkTag || tagsFor(contact).includes(bulkTag));
   const bulkSourceLabel = selectedDraftableContacts.length ? `${selectedDraftableContacts.length} selected contact${selectedDraftableContacts.length === 1 ? "" : "s"}` : "all draftable contacts";
+  const needsBulkTemplate = bulkMode !== "ai_only";
+  const bulkTemplateMissing = needsBulkTemplate && !bulkTemplateId;
+  const selectedDraftButtonTitle = selectedContacts.length && !selectedDraftableContacts.length
+    ? "Selected contacts are already sent, paused, blocked, deleted, or otherwise not draftable."
+    : selectedExcludedCount
+      ? `${selectedExcludedCount} selected contact${selectedExcludedCount === 1 ? "" : "s"} will be excluded because their status is not draftable.`
+      : "Generate drafts for selected draftable contacts.";
   useEffect(() => {
     setSelectedContactIds((current) => current.filter((id) => contacts.some((contact) => contact.id === id)));
   }, [contacts]);
@@ -662,11 +676,19 @@ function ContactsPanel({
     onError: (error) => toast(apiErrorMessage(error, "contact restore failed"))
   });
   const startBulk = useMutation({
-    mutationFn: () => api.generateBulkDrafts({ contact_ids: bulkContacts.map((contact) => contact.id), provider: bulkProvider, tone: bulkTone }),
+    mutationFn: () => api.generateBulkDrafts({
+      contact_ids: bulkContacts.map((contact) => contact.id),
+      provider: bulkProvider,
+      tone: bulkTone,
+      mode: bulkMode,
+      template_id: needsBulkTemplate ? bulkTemplateId : undefined,
+      instruction: bulkInstruction.trim() || undefined
+    }),
     onSuccess: (job) => {
       setBulkJob(job);
       toast(`Generating drafts... ${job.completed} / ${job.total} complete`);
-    }
+    },
+    onError: (error) => toast(apiErrorMessage(error, "bulk generation failed"))
   });
   useEffect(() => {
     if (!bulkJob || bulkJob.status !== "running") return;
@@ -719,7 +741,8 @@ function ContactsPanel({
         <button
           className="button primary"
           type="button"
-          disabled={selectedDraftableContacts.length < 2 || startBulk.isPending || bulkJob?.status === "running"}
+          disabled={!selectedDraftableContacts.length || startBulk.isPending || bulkJob?.status === "running"}
+          title={selectedDraftButtonTitle}
           onClick={() => {
             setBulkTag("");
             setBulkJob(null);
@@ -872,19 +895,45 @@ function ContactsPanel({
       </div>
       {bulkOpen && (
         <div className="modal-backdrop">
-          <div className="modal">
+          <div className="modal bulk-draft-modal">
             <h3>Generate Cluster Drafts</h3>
             <div className="grid gap-3">
+              <label>Mode
+                <select value={bulkMode} onChange={(e) => setBulkMode(e.target.value as BulkDraftMode)}>
+                  <option value="ai_only">AI only</option>
+                  <option value="template_only">Template only</option>
+                  <option value="template_plus_ai">Template + AI</option>
+                </select>
+              </label>
+              {needsBulkTemplate && (
+                <label>Template
+                  <select value={bulkTemplateId} onChange={(e) => setBulkTemplateId(e.target.value)}>
+                    <option value="">Select a template</option>
+                    {templates.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}
+                  </select>
+                </label>
+              )}
               <label>Provider<select value={bulkProvider} onChange={(e) => setBulkProvider(e.target.value)}><option>groq</option><option>gemini</option><option>auto</option></select></label>
               <label>Tone Override<select value={bulkTone} onChange={(e) => setBulkTone(e.target.value)}><option>Professional</option><option>Friendly</option><option>Casual</option><option>Direct</option><option>Storytelling</option></select></label>
               <label>Tag Filter<select value={bulkTag} onChange={(e) => setBulkTag(e.target.value)}><option value="">All in cluster</option>{allTags.map((tag) => <option key={tag}>{tag}</option>)}</select></label>
+              <label>Instruction
+                <textarea
+                  rows={3}
+                  value={bulkInstruction}
+                  onChange={(e) => setBulkInstruction(e.target.value)}
+                  placeholder="Optional angle, constraint, or CTA for this batch"
+                />
+              </label>
               <div className="notice">Cluster source: {bulkSourceLabel}</div>
+              {selectedExcludedCount > 0 && <div className="notice warning">{selectedExcludedCount} selected contact{selectedExcludedCount === 1 ? "" : "s"} excluded because their status is not draftable.</div>}
+              {bulkTemplateMissing && <div className="notice warning">Choose a template before starting this bulk mode.</div>}
               <div className="notice">Will generate drafts for {bulkContacts.length} contacts. Existing unapproved drafts are skipped.</div>
               {bulkJob && <div className="notice">Generating drafts... {bulkJob.completed} / {bulkJob.total} complete</div>}
+              {bulkJob?.errors?.length ? <div className="notice warning">Recent job notices: {bulkJob.errors.slice(0, 3).join(", ")}</div> : null}
             </div>
             <div className="mt-4 flex justify-end gap-2">
               <button className="button secondary" onClick={() => setBulkOpen(false)}>Cancel</button>
-              <button className="button primary" disabled={!bulkContacts.length || startBulk.isPending || bulkJob?.status === "running"} onClick={() => startBulk.mutate()}>
+              <button className="button primary" disabled={!bulkContacts.length || bulkTemplateMissing || startBulk.isPending || bulkJob?.status === "running"} onClick={() => startBulk.mutate()}>
                 <Sparkles className={startBulk.isPending || bulkJob?.status === "running" ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Start Generation
               </button>
             </div>
