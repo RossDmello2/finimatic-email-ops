@@ -1995,23 +1995,68 @@ function ConversationsPanel({ contacts, summaries, settings, providerHealth }: {
   );
 }
 
+type AutoReplyModeSelection = "off" | "propose" | "autonomous";
+
+function autoReplyModeSelection(settings?: SettingsRead): AutoReplyModeSelection {
+  if (!settings?.auto_reply_enabled) return "off";
+  return settings.auto_reply_mode === "autonomous" ? "autonomous" : "propose";
+}
+
+function autoReplyModePayload(mode: AutoReplyModeSelection) {
+  return mode === "off" ? { auto_reply_enabled: false } : { auto_reply_enabled: true, auto_reply_mode: mode };
+}
+
+function applyAutoReplyMode(settings: SettingsRead, mode: AutoReplyModeSelection): SettingsRead {
+  return {
+    ...settings,
+    auto_reply_enabled: mode !== "off",
+    auto_reply_mode: mode === "off" ? settings.auto_reply_mode : mode
+  };
+}
+
 function AutoReplyPanel({ pending, log, navigate, settings }: { pending: AutoReplyPending[]; log: AuditEvent[]; navigate: (surface: Surface) => void; settings?: SettingsRead }) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<"pending" | "log">("pending");
   const [logFilter, setLogFilter] = useState("");
-  const autoReplyEnabled = Boolean(settings?.auto_reply_enabled);
-  const autoReplyMode = settings?.auto_reply_mode ?? "propose";
+  const savedMode = autoReplyModeSelection(settings);
+  const [selectedMode, setSelectedMode] = useState<AutoReplyModeSelection>(savedMode);
   const updateMode = useMutation({
-    mutationFn: (mode: "off" | "propose" | "autonomous") =>
-      api.updateSettings(mode === "off" ? { auto_reply_enabled: false } : { auto_reply_enabled: true, auto_reply_mode: mode }),
+    mutationFn: (mode: AutoReplyModeSelection) => api.updateSettings(autoReplyModePayload(mode)),
+    onMutate: (mode) => {
+      setSelectedMode(mode);
+      const previous = queryClient.getQueryData<SettingsRead>(["settings"]);
+      if (previous) {
+        queryClient.setQueryData(["settings"], applyAutoReplyMode(previous, mode));
+      }
+      return { previous };
+    },
     onSuccess: (next) => {
+      queryClient.setQueryData(["settings"], next);
+      setSelectedMode(autoReplyModeSelection(next));
       toast(!next.auto_reply_enabled ? "auto-reply turned off" : next.auto_reply_mode === "autonomous" ? "autonomous auto-reply enabled" : "approval mode enabled");
+    },
+    onError: (error, _mode, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(["settings"], context.previous);
+        setSelectedMode(autoReplyModeSelection(context.previous));
+      } else {
+        setSelectedMode(savedMode);
+      }
+      toast(apiErrorMessage(error, "auto-reply mode update failed"));
+    },
+    onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["settings"] });
       void queryClient.invalidateQueries({ queryKey: ["auto-reply-pending"] });
       void queryClient.invalidateQueries({ queryKey: ["auto-reply-log"] });
-    },
-    onError: (error) => toast(apiErrorMessage(error, "auto-reply mode update failed"))
+    }
   });
+  useEffect(() => {
+    if (!updateMode.isPending) setSelectedMode(savedMode);
+  }, [savedMode, updateMode.isPending]);
+  const modeCopy = selectedMode === "autonomous" ? "Autonomous send" : selectedMode === "propose" ? "Approval required" : "Off";
+  const modeButtonClass = (mode: AutoReplyModeSelection) =>
+    [selectedMode === mode ? "active" : "", updateMode.isPending && selectedMode === mode ? "saving" : ""].filter(Boolean).join(" ");
+  const modeButtonDisabled = (mode: AutoReplyModeSelection) => !settings || updateMode.isPending || selectedMode === mode;
   const fetchNow = useMutation({
     mutationFn: api.fetchReplies,
     onSuccess: async (result) => {
@@ -2082,26 +2127,30 @@ function AutoReplyPanel({ pending, log, navigate, settings }: { pending: AutoRep
       <div className="auto-reply-mode-row">
         <div className="mode-copy">
           <strong>Mode</strong>
-          <span>{autoReplyEnabled ? (autoReplyMode === "autonomous" ? "Autonomous send" : "Approval required") : "Off"}</span>
+          <span>{modeCopy}</span>
+          {updateMode.isPending && <small aria-live="polite">Saving...</small>}
         </div>
-        <div className="segmented auto-reply-mode-control" aria-label="Auto reply mode">
+        <div className={updateMode.isPending ? "segmented auto-reply-mode-control saving" : "segmented auto-reply-mode-control"} aria-label="Auto reply mode" aria-busy={updateMode.isPending}>
           <button
-            className={!autoReplyEnabled ? "active" : ""}
-            disabled={updateMode.isPending}
+            className={modeButtonClass("off")}
+            disabled={modeButtonDisabled("off")}
+            aria-pressed={selectedMode === "off"}
             onClick={() => updateMode.mutate("off")}
           >
             <PauseCircle className="h-4 w-4" /> Off
           </button>
           <button
-            className={autoReplyEnabled && autoReplyMode === "propose" ? "active" : ""}
-            disabled={updateMode.isPending}
+            className={modeButtonClass("propose")}
+            disabled={modeButtonDisabled("propose")}
+            aria-pressed={selectedMode === "propose"}
             onClick={() => updateMode.mutate("propose")}
           >
             <Check className="h-4 w-4" /> Approval required
           </button>
           <button
-            className={autoReplyEnabled && autoReplyMode === "autonomous" ? "active" : ""}
-            disabled={updateMode.isPending}
+            className={modeButtonClass("autonomous")}
+            disabled={modeButtonDisabled("autonomous")}
+            aria-pressed={selectedMode === "autonomous"}
             onClick={() => updateMode.mutate("autonomous")}
           >
             <Send className="h-4 w-4" /> Autonomous send
