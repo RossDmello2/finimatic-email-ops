@@ -222,14 +222,27 @@ class AgenticToolExecutor:
             }
             for row in rows
         ]
+        latest_reply = (
+            db.query(Reply)
+            .filter(Reply.contact_id == contact.id, Reply.archived_at.is_(None))
+            .order_by(Reply.received_at.desc(), Reply.created_at.desc())
+            .first()
+        )
         return _envelope(
             "email_read_thread",
-            "success" if messages else "empty",
+            "success" if messages or latest_reply else "empty",
             {
                 "contact_id": contact.id,
                 "contact_email": contact.email,
                 "contact_name": contact.creator_name or contact.business_name or contact.email,
                 "messages": messages,
+                "latest_reply": {
+                    "reply_classified_as": latest_reply.classified_as,
+                    "raw_summary": sanitize_text(latest_reply.raw_summary or "", limit=200),
+                    "received_at": iso(latest_reply.received_at),
+                }
+                if latest_reply
+                else None,
             },
         )
 
@@ -355,16 +368,20 @@ class AgenticToolExecutor:
         if contact_id:
             query = query.filter(FollowUpSequence.contact_id == contact_id)
         rows = query.order_by(FollowUpSequence.due_at.asc()).limit(25).all()
-        items = [
-            {
-                "contact_id": row.contact_id,
-                "sequence_num": row.sequence_num,
-                "status": row.status,
-                "due_at": iso(row.due_at),
-                "stop_reason": row.stop_reason,
-            }
-            for row in rows
-        ]
+        items = []
+        for row in rows:
+            contact = db.get(Contact, row.contact_id)
+            items.append(
+                {
+                    "contact_id": row.contact_id,
+                    "contact_email": contact.email if contact else None,
+                    "contact_name": (contact.creator_name or contact.business_name) if contact else None,
+                    "sequence_num": row.sequence_num,
+                    "status": row.status,
+                    "due_at": iso(row.due_at),
+                    "stop_reason": row.stop_reason,
+                }
+            )
         return _envelope("followup_status", "success" if items else "empty", {"items": items})
 
     def _queue_status(self, db: Session) -> EvidenceEnvelope:
@@ -416,7 +433,26 @@ class AgenticToolExecutor:
         goal_lower = reply_goal.lower()
         response_goal = any(phrase in goal_lower for phrase in ("reply", "response", "respond", "draft", "compose", "write an email"))
         followup_goal = any(phrase in goal_lower for phrase in ("follow-up", "follow up"))
-        if history and response_goal and not followup_goal and not _has_unanswered_inbound(history):
+        explicit_email_target = bool(re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", reply_goal))
+        intentional_new_reply = response_goal and any(
+            phrase in goal_lower
+            for phrase in (
+                "generate",
+                "draft",
+                "write",
+                "compose",
+                "create",
+                "prepare",
+                "can you",
+                "can u",
+                "please",
+                "reply them back",
+                "reply him back",
+                "reply her back",
+                "reply back",
+            )
+        ) and explicit_email_target
+        if history and response_goal and not followup_goal and not intentional_new_reply and not _has_unanswered_inbound(history):
             latest_outbound = next((message for message in history if message.direction == "outbound"), None)
             contact_name = contact.creator_name or contact.business_name or contact.email
             subject = latest_outbound.subject if latest_outbound and latest_outbound.subject else "the latest thread"
@@ -445,7 +481,8 @@ class AgenticToolExecutor:
                     instruction=(
                         "Draft a follow-up based only on this contact's conversation history. "
                         "Preserve the contact's niche and latest scheduling or question context. "
-                        "Use one clear CTA, stay under 180 words, and do not mention other contacts."
+                        "Use one clear CTA, stay under 180 words, and do not mention other contacts. "
+                        f"User requested follow-up goal: {sanitize_text(reply_goal, limit=300)}"
                     ),
                 ),
             )

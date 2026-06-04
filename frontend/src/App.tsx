@@ -2287,11 +2287,37 @@ function SuppressionsPanel({ suppressions }: { suppressions: Suppression[] }) {
 }
 
 function AuditPanel({ audit }: { audit: AuditEvent[] }) {
+  const rows = [...audit].reverse().map((row) => [
+    row.created_at,
+    row.event_label ?? humanizeAuditEvent(row.event_type),
+    auditWho(row),
+    row.detail ?? auditFallbackDetail(row)
+  ]);
   return (
     <Panel title="Audit Logs" icon={Database}>
-      <DataTable columns={["time", "event", "entity"]} rows={audit.map((row) => [row.created_at, row.event_type, row.entity_type ?? ""])} />
+      <DataTable columns={["time", "what happened", "who", "details"]} rows={rows} />
     </Panel>
   );
+}
+
+function auditWho(row: AuditEvent): string {
+  if (row.contact_name && row.contact_email) return `${row.contact_name} (${row.contact_email})`;
+  return row.contact_name ?? row.contact_email ?? row.entity_label ?? row.entity_type ?? "";
+}
+
+function auditFallbackDetail(row: AuditEvent): string {
+  const payload = Object.entries(row.payload ?? {})
+    .filter(([key]) => !/password|secret|token|credential|key|hash/i.test(key))
+    .slice(0, 3)
+    .map(([key, value]) => `${humanizeAuditEvent(key)}: ${previewValue(Array.isArray(value) ? value.join(", ") : value, 60)}`)
+    .join(", ");
+  const base = row.event_label ?? humanizeAuditEvent(row.event_type);
+  return payload ? `${base} (${payload}).` : `${base}.`;
+}
+
+function humanizeAuditEvent(value: string): string {
+  const compact = value.replace(/[_.]+/g, " ").trim();
+  return compact ? compact.charAt(0).toUpperCase() + compact.slice(1) : "";
 }
 
 function ErrorsPanel({ audit }: { audit: AuditEvent[] }) {

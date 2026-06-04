@@ -78,6 +78,9 @@ def _extract_name_or_email(text: str) -> str | None:
         r"\bsuppressed\??\s*$",
         r"\bshow\s+(.+?)(?:'s)?\s+(?:thread|conversation)\b",
         r"\bread\s+(.+?)(?:'s)?\s+(?:thread|conversation)\b",
+        r"\bread\s+(?:the\s+)?reply\s+from\s+(.+?)(?:\s+(?:with|in|today|now)\b|$)",
+        r"\bwhat\s+did\s+(.+?)\s+(?:reply|replied|replyed|say|said)\b",
+        r"\bwhat\s+has\s+(.+?)\s+(?:replied|said)\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -86,7 +89,7 @@ def _extract_name_or_email(text: str) -> str | None:
                 continue
             value = match.group(1).strip(" .,'\"")
             value = re.sub(r"^the\s+", "", value, flags=re.IGNORECASE)
-            if value and value.lower() not in {"it", "the", "a", "reply", "draft"}:
+            if value and value.lower() not in {"it", "the", "a", "reply", "draft", "he", "she", "him", "her", "they", "them", "that", "this", "same"}:
                 return value
     return None
 

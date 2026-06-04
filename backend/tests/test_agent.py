@@ -94,6 +94,184 @@ def test_agent_awareness_distinguishes_outbound_replies(client):
     assert "You wrote" in response["response"]
 
 
+def test_agent_reuses_single_sent_contact_for_followup_draft(client, monkeypatch):
+    configure_sender(client, canary_verified=True, dry_run=False)
+    contact = _create_contact(client, email="context-followup@example.com", name="Context Followup")
+    with SessionLocal() as db:
+        db.add(
+            ConversationMessage(
+                contact_id=contact["id"],
+                direction="outbound",
+                subject="Re: RAG chatbot",
+                body="I sent the prior follow-up about the RAG chatbot scope.",
+                source="queue",
+                occurred_at=utcnow() - timedelta(minutes=20),
+            )
+        )
+        db.commit()
+
+    async def fake_next_reply(db, contact, history, payload):
+        assert contact.email == "context-followup@example.com"
+        assert "can we met and discuss" in payload.instruction
+        return {
+            "subject": "Re: RAG chatbot",
+            "body": "Context Followup, can we meet and discuss the RAG chatbot scope this week?\n\nBest regards\nRoss Dmello",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr("app.agent.tools._generate_next_reply", fake_next_reply)
+
+    first = _chat(client, "who all did i send a follow up mail in last hour", session_token="session-follow-context")
+    second = _chat(client, "can u send another follow up mail asking can we met and discuss", session_token="session-follow-context")
+
+    assert first["channel"] == "awareness"
+    assert "context-followup@example.com" in first["response"]
+    assert second["intent"] == "email_generate_draft"
+    assert second["draft"]["to"] == "context-followup@example.com"
+    assert "meet and discuss" in second["draft"]["body"]
+    assert second["pending_action"]
+
+
+def test_agent_explicit_email_followup_request_generates_pending_draft(client, monkeypatch):
+    configure_sender(client, canary_verified=True, dry_run=False)
+    contact = _create_contact(client, email="explicit-followup@example.com", name="Explicit Followup")
+    with SessionLocal() as db:
+        db.add(
+            ConversationMessage(
+                contact_id=contact["id"],
+                direction="outbound",
+                subject="Re: RAG chatbot",
+                body="Prior follow-up.",
+                source="queue",
+                occurred_at=utcnow(),
+            )
+        )
+        db.commit()
+
+    async def fake_next_reply(db, contact, history, payload):
+        assert contact.email == "explicit-followup@example.com"
+        return {
+            "subject": "Re: RAG chatbot",
+            "body": "Explicit Followup, can we meet and discuss the RAG chatbot scope?\n\nBest regards\nRoss Dmello",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr("app.agent.tools._generate_next_reply", fake_next_reply)
+
+    response = _chat(client, "can u send another follow up mail asking can we met and discuss for explicit-followup@example.com")
+
+    assert response["intent"] == "email_generate_draft"
+    assert response["draft"]["to"] == "explicit-followup@example.com"
+    assert response["pending_action"]
+
+
+def test_agent_uses_single_recent_reply_context_for_pronoun_question(client):
+    contact = _create_contact(client, email="dev-khan@example.com", name="dev khan")
+    client.post(
+        "/api/replies",
+        json={
+            "contact_id": contact["id"],
+            "classified_as": "question",
+            "raw_summary": "Okay, what is this mail about and how can I contribute to it?",
+        },
+    )
+
+    first = _chat(client, "who all replied in last 1 hour", session_token="session-dev-context")
+    second = _chat(client, "what did he reply", session_token="session-dev-context")
+    named = _chat(client, "what did dev khan replyed", session_token="session-dev-named")
+
+    assert "dev khan" in first["response"].lower()
+    assert "Which contact" not in second["response"]
+    assert "what is this mail about" in second["response"]
+    assert named["intent"] == "email_read_thread"
+    assert "what is this mail about" in named["response"]
+
+
+def test_agent_reply_back_uses_active_recent_reply_contact_for_draft(client, monkeypatch):
+    monkeypatch.setenv("FINIMATIC_FAKE_AI", "1")
+    configure_sender(client, canary_verified=True, dry_run=False)
+    contact = _create_contact(client, email="reply-back@example.com", name="Reply Back")
+    client.post(
+        "/api/replies",
+        json={
+            "contact_id": contact["id"],
+            "classified_as": "question",
+            "raw_summary": "Can you share what this email is about?",
+        },
+    )
+
+    first = _chat(client, "who all replied in last 1 hour", session_token="session-reply-back")
+    second = _chat(client, "reply them back", session_token="session-reply-back")
+
+    assert "reply-back@example.com" in first["response"]
+    assert second["intent"] == "email_generate_draft"
+    assert second["draft"]["to"] == "reply-back@example.com"
+    assert second["pending_action"]
+    assert "Which contact" not in second["response"]
+
+
+def test_agent_generate_short_reply_for_contact_bypasses_status_shortcut(client, monkeypatch):
+    monkeypatch.setenv("FINIMATIC_FAKE_AI", "1")
+    configure_sender(client, canary_verified=True, dry_run=False)
+    contact = _create_contact(client, email="already-sent@example.com", name="Already Sent")
+    with SessionLocal() as db:
+        db.add(
+            ConversationMessage(
+                contact_id=contact["id"],
+                direction="outbound",
+                subject="Previous proof",
+                body="A previous proof email was sent.",
+                source="queue",
+                occurred_at=utcnow(),
+            )
+        )
+        db.commit()
+
+    response = _chat(client, "generate a short reply for already-sent@example.com saying this is a controlled local proof")
+
+    assert response["intent"] == "email_generate_draft"
+    assert response["draft"]["to"] == "already-sent@example.com"
+    assert response["pending_action"]
+    assert "already replied" not in response["response"].lower()
+
+
+def test_agent_confirmation_hash_uses_stored_draft_body(client, monkeypatch):
+    configure_sender(client, canary_verified=True, dry_run=False)
+    contact = _create_contact(client, email="stored-body@example.com", name="Stored Body")
+    with SessionLocal() as db:
+        db.add(
+            ConversationMessage(
+                contact_id=contact["id"],
+                direction="outbound",
+                subject="Previous proof",
+                body="A previous proof email was sent.",
+                source="queue",
+                occurred_at=utcnow(),
+            )
+        )
+        db.commit()
+
+    async def fake_next_reply(db, contact, history, payload):
+        return {
+            "subject": "Re: Previous proof",
+            "body": "Stored Body, this controlled proof mentions tokens and scopes without including any secret values.",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr("app.agent.tools._generate_next_reply", fake_next_reply)
+
+    response = _chat(client, "generate a short reply for stored-body@example.com saying this is a controlled local proof")
+    confirmed = client.post(
+        "/api/agent/confirm",
+        json={"session_token": SESSION_A, "action_id": response["pending_action"]["action_id"]},
+    ).json()
+
+    assert "tokens and scopes" in response["draft"]["body"]
+    assert confirmed["error_code"] is None
+    assert len(client.app.state.transport.sent) == 1
+    assert "tokens and scopes" in client.app.state.transport.sent[0]["body"]
+
+
 def test_tool_read_thread(client):
     contact = _create_contact(client, email="thread@example.com", name="Thread Lead")
     long_body = "x" * 260
@@ -566,16 +744,22 @@ def test_cancel(client, monkeypatch):
 
 
 def test_no_raw_key_in_response(client):
+    groq_prefix = "gsk" + "_"
+    gemini_prefix = "AI" + "za"
     contact = _create_contact(client, email="secret-reply@example.com", name="Secret Reply")
     client.post(
         "/api/replies",
-        json={"contact_id": contact["id"], "classified_as": "reply", "raw_summary": "gsk_secret AIzaSecret app_password"},
+        json={
+            "contact_id": contact["id"],
+            "classified_as": "reply",
+            "raw_summary": f"{groq_prefix}secret {gemini_prefix}Secret app_password",
+        },
     )
 
     response = _chat(client, "who replied today?")
 
-    assert "gsk_" not in str(response)
-    assert "AIza" not in str(response)
+    assert groq_prefix not in str(response)
+    assert gemini_prefix not in str(response)
     assert "app_password" not in str(response)
 
 
@@ -639,12 +823,18 @@ def test_expired_agent_session_reuses_token_without_integrity_error(client):
 
 
 def test_audit_redacts_secret_like_values(client):
+    groq_prefix = "gsk" + "_"
+    gemini_prefix = "AI" + "za"
     with SessionLocal() as db:
         emit_event(
             db,
             "agent.security_test",
             payload={
-                "message": "token=abc123secret gsk_liveSecret AIzaLiveSecret gAAAAabcdefghijklmnopqrstuvwxyz0123456789",
+                "message": (
+                    "token=abc123secret "
+                    f"{groq_prefix}liveSecret {gemini_prefix}LiveSecret "
+                    "gAAAAabcdefghijklmnopqrstuvwxyz0123456789"
+                ),
                 "nested": {"api_key": "plain-secret"},
             },
         )
@@ -653,11 +843,29 @@ def test_audit_redacts_secret_like_values(client):
     payloads = [row["payload"] for row in client.get("/api/audit").json()["items"]]
     rendered = str(payloads)
 
-    assert "gsk_" not in rendered
-    assert "AIza" not in rendered
+    assert groq_prefix not in rendered
+    assert gemini_prefix not in rendered
     assert "gAAAA" not in rendered
     assert "abc123secret" not in rendered
     assert "plain-secret" not in rendered
+
+
+def test_audit_rows_include_layman_contact_detail(client):
+    contact = _create_contact(client, email="audit-readable@example.com", name="Audit Readable")
+    with SessionLocal() as db:
+        draft = Draft(contact_id=contact["id"], subject="Readable audit subject", body="Body", approved=True)
+        db.add(draft)
+        db.flush()
+        emit_event(db, "draft.approved", entity_type="draft", entity_id=draft.id, payload={"queue_id": "queue-123"})
+        db.commit()
+
+    row = [item for item in client.get("/api/audit").json()["items"] if item["event_type"] == "draft.approved"][-1]
+
+    assert row["event_label"] == "Draft approved"
+    assert row["contact_name"] == "Audit Readable"
+    assert row["contact_email"] == "audit-readable@example.com"
+    assert "Audit Readable (audit-readable@example.com)" in row["detail"]
+    assert "draft.approved" not in row["detail"]
 
 
 def test_generate_draft_not_send(client, monkeypatch):

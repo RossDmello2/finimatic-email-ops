@@ -235,7 +235,19 @@ export type ConversationSummary = { contact_id: string; email: string; name: str
 export type ConversationMessage = { id: string; contact_id: string; direction: "inbound" | "outbound"; subject?: string | null; body: string; source: string; auto_sent?: boolean; external_message_id?: string | null; occurred_at?: string | null; created_at?: string | null };
 export type ConversationDetail = { contact: ConversationSummary; messages: ConversationMessage[] };
 export type ConversationDraft = { subject: string; body: string; reasoning_summary?: string; provider: string; model?: string };
-export type AuditEvent = { id: string; event_type: string; entity_type?: string; entity_id?: string; payload: Record<string, unknown>; created_at: string };
+export type AuditEvent = {
+  id: string;
+  event_type: string;
+  entity_type?: string;
+  entity_id?: string;
+  payload: Record<string, unknown>;
+  created_at: string;
+  event_label?: string | null;
+  entity_label?: string | null;
+  contact_name?: string | null;
+  contact_email?: string | null;
+  detail?: string | null;
+};
 export type ProviderHealth = { id: string; provider: string; status: string; last_checked?: string | null; error_code?: string | null; details?: string | null };
 export type AutoReplyPending = { id: string; contact_id: string; contact_name?: string; contact_email?: string; their_reply: string; subject: string; body: string; generated_at?: string | null };
 export type ImportPreview = { batch_id_temp: string; rows: ImportRow[]; summary: Record<string, number> };
