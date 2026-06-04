@@ -62,8 +62,6 @@ class ResponseAgent:
                 lines.append(f"...and {remaining} more replies in this window.")
             return sanitize_text("\n".join(lines))
         if intent.capability == "email_read_thread":
-            if not latest.data.get("messages"):
-                return "I found the contact, but there are no conversation messages yet."
             contact_label = latest.data.get("contact_name") or latest.data.get("contact_email")
             if any(phrase in lowered_message for phrase in ("most recent message", "latest message", "what did")):
                 inbound = [item for item in latest.data.get("messages", []) if item.get("direction") == "inbound"]
@@ -72,6 +70,18 @@ class ResponseAgent:
                     return sanitize_text(
                         f"Latest reply from {contact_label} ({latest.data.get('contact_email')}): {item.get('body')}"
                     )
+                latest_reply = latest.data.get("latest_reply") or {}
+                if latest_reply.get("raw_summary"):
+                    return sanitize_text(
+                        f"Latest reply from {contact_label} ({latest.data.get('contact_email')}): {latest_reply.get('raw_summary')}"
+                    )
+            if not latest.data.get("messages"):
+                latest_reply = latest.data.get("latest_reply") or {}
+                if latest_reply.get("raw_summary"):
+                    return sanitize_text(
+                        f"Latest reply from {contact_label} ({latest.data.get('contact_email')}): {latest_reply.get('raw_summary')}"
+                    )
+                return "I found the contact, but there are no conversation messages yet."
             lines = [f"Thread for {contact_label} ({latest.data.get('contact_email')}):"]
             for item in latest.data.get("messages", [])[-5:]:
                 speaker = "You wrote" if item.get("direction") == "outbound" else "They wrote"
@@ -105,7 +115,14 @@ class ResponseAgent:
             items = latest.data.get("items") or []
             if not items:
                 return "No follow-up rows matched."
-            return sanitize_text("Follow-up status:\n" + "\n".join(f"- contact {item.get('contact_id')}: sequence {item.get('sequence_num')} {item.get('status')}" for item in items[:10]))
+            lines = ["Follow-up status:"]
+            for item in items[:10]:
+                name = item.get("contact_name") or item.get("contact_email") or "contact"
+                email = f" ({item.get('contact_email')})" if item.get("contact_email") else ""
+                sequence = item.get("sequence_num")
+                status = item.get("status") or "pending"
+                lines.append(f"- {name}{email}: follow-up #{sequence} {status}")
+            return sanitize_text("\n".join(lines))
         if intent.capability == "email_generate_draft":
             if latest.status == "error":
                 return "I could not generate a draft with the configured model provider. Retry with another provider or create a manual draft."

@@ -13,4 +13,4 @@ router = APIRouter(prefix="/api/audit", tags=["audit"])
 @router.get("")
 def list_audit(db: Session = Depends(get_db)):
     items = db.query(AuditEvent).order_by(AuditEvent.created_at.asc()).all()
-    return {"items": [audit_to_dict(item) for item in items], "total": len(items)}
+    return {"items": [audit_to_dict(item, db) for item in items], "total": len(items)}

@@ -2,7 +2,7 @@ import json
 from datetime import timedelta
 
 from app.core.time import utcnow
-from app.db.models import Contact, FollowUpSequence, SendQueue
+from app.db.models import Contact, Draft, FollowUpSequence, SendQueue
 from app.db.session import SessionLocal
 
 
@@ -55,7 +55,15 @@ def test_contact_delete_cancels_pending_queue_and_due_followups(client):
         "/api/drafts",
         json={"contact_id": contact["id"], "subject": "Hello", "body": "Body"},
     ).json()
-    approved = client.post(f"/api/drafts/{draft['id']}/approve").json()
+    with SessionLocal() as db:
+        stored_draft = db.get(Draft, draft["id"])
+        stored_draft.approved = True
+        stored_draft.approved_at = utcnow()
+        db.commit()
+    queue = client.post(
+        "/api/queue",
+        json={"contact_id": contact["id"], "draft_id": draft["id"], "sequence_num": 1},
+    ).json()
 
     with SessionLocal() as db:
         db.add(FollowUpSequence(contact_id=contact["id"], sequence_num=2, due_at=utcnow(), status="due"))
@@ -66,9 +74,9 @@ def test_contact_delete_cancels_pending_queue_and_due_followups(client):
     assert response.status_code == 200
 
     with SessionLocal() as db:
-        queue = db.get(SendQueue, approved["queue_id"])
-        assert queue.status == "cancelled"
-        assert json.loads(queue.policy_block_reasons) == ["CONTACT_DELETED"]
+        queue_row = db.get(SendQueue, queue["id"])
+        assert queue_row.status == "cancelled"
+        assert json.loads(queue_row.policy_block_reasons) == ["CONTACT_DELETED"]
         followups = db.query(FollowUpSequence).filter(FollowUpSequence.contact_id == contact["id"]).all()
         assert {followup.sequence_num: followup.status for followup in followups} == {2: "stopped", 3: "stopped"}
         assert all(followup.stop_reason == "CONTACT_DELETED" for followup in followups)

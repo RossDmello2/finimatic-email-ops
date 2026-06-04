@@ -41,6 +41,7 @@ import {
   ConversationSummary,
   Draft,
   Followup,
+  FollowupApprovalResponse,
   ImportCommit,
   ImportPreview,
   QueueEntry,
@@ -48,7 +49,8 @@ import {
   SettingsRead,
   Suppression,
   TemplateRow,
-  ProviderHealth
+  ProviderHealth,
+  ApprovalResponse
 } from "./api/client";
 import { AssistantWidget } from "./features/floating-assistant/AssistantWidget";
 
@@ -186,6 +188,9 @@ function apiErrorMessage(error: unknown, fallback: string) {
       return `${fallback}: ${parsed.detail}`;
     }
     if (typeof parsed.detail?.reason === "string") {
+      if (typeof parsed.detail.message === "string") {
+        return `${fallback}: ${parsed.detail.message}`;
+      }
       const reason = parsed.detail.reason.replaceAll("_", " ");
       const status = parsed.detail.status ? ` (${parsed.detail.status})` : "";
       if (parsed.detail.reason === "sequence_already_sent" && parsed.detail.next_sequence_num) {
@@ -197,6 +202,35 @@ function apiErrorMessage(error: unknown, fallback: string) {
     return error.message || fallback;
   }
   return error.message || fallback;
+}
+
+function deliveryToastMessage(result: ApprovalResponse | FollowupApprovalResponse, fallback: string) {
+  const reasons = result.queue?.policy_block_reasons?.filter(Boolean).join(", ");
+  const lastError = [result.queue?.last_attempt_error_code, result.queue?.last_attempt_error_detail].filter(Boolean).join(": ");
+  switch (result.delivery_status) {
+    case "sent":
+      return "Email sent.";
+    case "deferred":
+      return reasons ? `Approved. Deferred: ${reasons}.` : "Approved. Deferred until the send window or delay clears.";
+    case "blocked":
+      return reasons ? `Approved, but blocked: ${reasons}.` : "Approved, but blocked by delivery policy.";
+    case "dry_run_blocked":
+      return "Dry Run is on. Live mode is required before real delivery.";
+    case "failed":
+      return lastError ? `Approved, but delivery failed: ${lastError}.` : "Approved, but delivery failed.";
+    case "queued_for_bulk":
+    case "queued":
+      return fallback;
+    default:
+      return result.delivery_status ? `Delivery status: ${result.delivery_status}.` : fallback;
+  }
+}
+
+function queueReason(row: QueueEntry) {
+  const reasons = row.policy_block_reasons?.filter(Boolean);
+  if (reasons?.length) return reasons.join(", ");
+  const attempt = [row.last_attempt_status, row.last_attempt_error_code, row.last_attempt_error_detail].filter(Boolean);
+  return attempt.length ? attempt.join(": ") : "none";
 }
 
 function App() {
@@ -960,8 +994,8 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
   });
   const approve = useMutation({
     mutationFn: ({ draftId, sequenceNum }: { draftId: string; sequenceNum?: number }) => api.approveDraft(draftId, sequenceNum ? { sequence_num: sequenceNum } : undefined),
-    onSuccess: (_result, variables) => {
-      toast(variables.sequenceNum ? `Follow-up #${variables.sequenceNum} approved and queued.` : "Draft approved - email queued for delivery. It is not sent until the queue processes it.");
+    onSuccess: (result, variables) => {
+      toast(deliveryToastMessage(result, variables.sequenceNum ? `Follow-up #${variables.sequenceNum} approved for delivery.` : "Draft approved for delivery."));
       invalidateAll(queryClient);
     },
     onError: (error) => toast(apiErrorMessage(error, "draft approval failed"))
@@ -972,8 +1006,8 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
       await api.updateDraft(activeDraftId, { subject, body });
       return api.approveDraft(activeDraftId, editorApproveSequence ? { sequence_num: editorApproveSequence } : undefined);
     },
-    onSuccess: () => {
-      toast(editorApproveSequence ? `Follow-up #${editorApproveSequence} saved and queued.` : "Draft saved and approved - email queued for delivery. It is not sent until the queue processes it.");
+    onSuccess: (result) => {
+      toast(deliveryToastMessage(result, editorApproveSequence ? `Follow-up #${editorApproveSequence} saved and approved for delivery.` : "Draft saved and approved for delivery."));
       invalidateAll(queryClient);
     },
     onError: (error) => toast(apiErrorMessage(error, "draft approval failed"))
@@ -991,7 +1025,7 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
   const approveBulk = useMutation({
     mutationFn: () => api.approveBulkDrafts(selectedDrafts),
     onSuccess: (result) => {
-      toast(`${result.approved} drafts approved and queued.`);
+      toast(`${result.approved} drafts approved and queued for bulk processing.`);
       setSelectedDrafts([]);
       invalidateAll(queryClient);
     }
@@ -1027,7 +1061,7 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
   }
   const activeDraftApproved = Boolean(activeDraft?.approved);
   const editorApproveSequence = contactId ? nextSequenceForContact(contactId) : undefined;
-  const editorApproveLabel = editorApproveSequence ? `Approve Follow-up #${editorApproveSequence}` : "Approve & Queue";
+  const editorApproveLabel = editorApproveSequence ? `Approve Follow-up #${editorApproveSequence}` : "Approve & Send";
   return (
     <Panel
       title="Drafts"
@@ -1203,7 +1237,7 @@ function DraftRow({ draft, contact, selected, onSelect, approve, approvePending,
         <button className="button secondary" onClick={() => save.mutate()}>Save</button>
         <button className="button secondary" disabled={!draft.approved || saveTemplate.isPending} onClick={promptTemplateName}>Save as Template</button>
         <button className={`button primary${approvePending ? " is-loading" : ""}`} disabled={draft.approved || approvePending} onClick={() => approve(draft.id)}>
-          <Check className={approvePending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{approvePending ? "Queueing..." : approveSequence ? `Approve Follow-up #${approveSequence}` : "Approve"}</span>
+          <Check className={approvePending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{approvePending ? "Sending..." : approveSequence ? `Approve Follow-up #${approveSequence}` : "Approve"}</span>
         </button>
       </div>
     </div>
@@ -1481,7 +1515,7 @@ function QueuePanel({ queue, contacts, drafts }: { queue: QueueEntry[]; contacts
           row.draft_subject ?? draftById.get(row.draft_id)?.subject ?? row.draft_id,
           String(row.sequence_num),
           row.scheduled_at,
-          row.policy_block_reasons.length ? row.policy_block_reasons.join(", ") : "none"
+          queueReason(row)
         ])}
       />
     </Panel>
@@ -1501,8 +1535,8 @@ function FollowupsPanel({ followups, navigate }: { followups: Followup[]; naviga
   });
   const approve = useMutation({
     mutationFn: api.approveFollowupDraft,
-    onSuccess: () => {
-      toast("follow-up queued");
+    onSuccess: (result) => {
+      toast(deliveryToastMessage(result, "Follow-up approved for delivery."));
       invalidateAll(queryClient);
     }
   });
@@ -2253,11 +2287,37 @@ function SuppressionsPanel({ suppressions }: { suppressions: Suppression[] }) {
 }
 
 function AuditPanel({ audit }: { audit: AuditEvent[] }) {
+  const rows = [...audit].reverse().map((row) => [
+    row.created_at,
+    row.event_label ?? humanizeAuditEvent(row.event_type),
+    auditWho(row),
+    row.detail ?? auditFallbackDetail(row)
+  ]);
   return (
     <Panel title="Audit Logs" icon={Database}>
-      <DataTable columns={["time", "event", "entity"]} rows={audit.map((row) => [row.created_at, row.event_type, row.entity_type ?? ""])} />
+      <DataTable columns={["time", "what happened", "who", "details"]} rows={rows} />
     </Panel>
   );
+}
+
+function auditWho(row: AuditEvent): string {
+  if (row.contact_name && row.contact_email) return `${row.contact_name} (${row.contact_email})`;
+  return row.contact_name ?? row.contact_email ?? row.entity_label ?? row.entity_type ?? "";
+}
+
+function auditFallbackDetail(row: AuditEvent): string {
+  const payload = Object.entries(row.payload ?? {})
+    .filter(([key]) => !/password|secret|token|credential|key|hash/i.test(key))
+    .slice(0, 3)
+    .map(([key, value]) => `${humanizeAuditEvent(key)}: ${previewValue(Array.isArray(value) ? value.join(", ") : value, 60)}`)
+    .join(", ");
+  const base = row.event_label ?? humanizeAuditEvent(row.event_type);
+  return payload ? `${base} (${payload}).` : `${base}.`;
+}
+
+function humanizeAuditEvent(value: string): string {
+  const compact = value.replace(/[_.]+/g, " ").trim();
+  return compact ? compact.charAt(0).toUpperCase() + compact.slice(1) : "";
 }
 
 function ErrorsPanel({ audit }: { audit: AuditEvent[] }) {
@@ -2535,7 +2595,7 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
       <div className="settings-section">
         <h3>AI Model Configuration</h3>
         <div className="form-grid">
-          <label>Groq Model<select value={groqModel} onChange={(e) => setGroqModel(e.target.value)}><option>llama-3.3-70b-versatile</option><option>llama-3.1-8b-instant</option><option>gemma2-9b-it</option><option>mixtral-8x7b-32768</option><option>gpt-oss-120b</option><option>gpt-oss-20b</option></select></label>
+          <label>Groq Model<select value={groqModel} onChange={(e) => setGroqModel(e.target.value)}><option value="llama-3.3-70b-versatile">Llama 3.3 70B Versatile</option><option value="llama-3.1-8b-instant">Llama 3.1 8B Instant</option><option value="gemma2-9b-it">Gemma2 9B IT</option><option value="mixtral-8x7b-32768">Mixtral 8x7B 32768</option><option value="openai/gpt-oss-120b">OpenAI GPT-OSS 120B</option><option value="openai/gpt-oss-20b">OpenAI GPT-OSS 20B</option></select></label>
           <label>Gemini Model<select value={geminiModel} onChange={(e) => setGeminiModel(e.target.value)}><option>gemini-2.5-flash</option></select></label>
         </div>
       </div>

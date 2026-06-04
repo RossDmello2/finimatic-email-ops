@@ -127,6 +127,7 @@ class AgentService:
                 turn_history=turn_history,
             )
             formatted = format_for_layman(raw_response, contact_map)
+            self._remember_single_contact_from_text(formatted, session, db)
             self._save_turn_state(session, safe_message, formatted, current_channel, "Campaign Data", turn_history, db)
             emit_event(
                 db,
@@ -169,6 +170,7 @@ class AgentService:
                 turn_history=turn_history,
             )
             formatted = format_for_layman(raw_response, contact_map)
+            self._remember_single_contact_from_text(formatted, session, db)
             self._save_turn_state(session, safe_message, formatted, current_channel, "Campaign Data", turn_history, db)
             emit_event(
                 db,
@@ -205,6 +207,7 @@ class AgentService:
                 error_code="capability_denied",
             )
         slots = self.slot.extract(safe_message, session.context_summary, intent)
+        self._apply_active_contact_if_continuation(safe_message, intent.capability, slots, session, db)
         emit_event(db, "agent.slots_filled", entity_type="agent_session", entity_id=session.id, payload={"slots": slots.slots_filled, "missing": slots.slots_missing})
 
         evidence: list[EvidenceEnvelope] = []
@@ -270,6 +273,7 @@ class AgentService:
         for plan in plans:
             evidence.append(await self.tools.execute(plan, session, db))
 
+        active_contact_id = self._active_contact_id_from_evidence(evidence, slots.slots_filled, session, db)
         reasoning = self.reasoning.reason(safe_message, intent, evidence)
         verification = self.verifier.verify(safe_message, intent, reasoning)
         response_text = self.response.compose(safe_message, intent, verification, evidence)
@@ -277,7 +281,7 @@ class AgentService:
         draft = None
         pending = None
         if intent.capability == "email_generate_draft" and evidence and evidence[-1].status == "success":
-            draft = self._draft_from_evidence(evidence[-1])
+            draft = self._draft_from_evidence(evidence[-1], db)
             if draft:
                 action = create_pending_action(session.id, draft.draft_id, draft.contact_id, draft.subject, draft.body, db)
                 emit_event(db, "agent.confirmation_created", entity_type="pending_email_action", entity_id=action.id, payload={"draft_id": draft.draft_id})
@@ -286,7 +290,7 @@ class AgentService:
             session.id,
             {
                 "current_goal": goal.user_goal,
-                "active_contact_id": slots.slots_filled.get("contact_id"),
+                "active_contact_id": active_contact_id,
                 "slots": slots.slots_filled,
                 "context_summary": session.context_summary,
                 "context_loaded_at": session.context_loaded_at,
@@ -384,18 +388,20 @@ class AgentService:
             }
         return {"contact_id": None, "message": "I could not find that contact. Which contact should I use?", "evidence": evidence}
 
-    def _draft_from_evidence(self, evidence: EvidenceEnvelope) -> AgentDraft | None:
+    def _draft_from_evidence(self, evidence: EvidenceEnvelope, db: Session | None = None) -> AgentDraft | None:
         draft_id = evidence.data.get("draft_id")
         contact_id = evidence.data.get("contact_id")
         if not draft_id or not contact_id:
             return None
+        stored = db.get(Draft, str(draft_id)) if db else None
+        contact = db.get(Contact, str(contact_id)) if db else None
         return AgentDraft(
             draft_id=str(draft_id),
             contact_id=str(contact_id),
-            to=str(evidence.data.get("to") or ""),
-            subject=str(evidence.data.get("subject") or ""),
-            body=str(evidence.data.get("body") or ""),
-            warnings=list(evidence.data.get("warnings") or []),
+            to=(contact.email if contact else str(evidence.data.get("to") or "")),
+            subject=(stored.subject if stored else str(evidence.data.get("subject") or "")),
+            body=(stored.body if stored else str(evidence.data.get("body") or "")),
+            warnings=(json.loads(stored.warnings or "[]") if stored and stored.warnings else list(evidence.data.get("warnings") or [])),
         )
 
     def _pending_to_schema(self, action: PendingEmailActionRow, draft: AgentDraft) -> PendingEmailAction:
@@ -505,6 +511,109 @@ class AgentService:
         contact_id = resolved.get("contact_id")
         return db.get(Contact, contact_id) if contact_id else None
 
+    def _apply_active_contact_if_continuation(self, message: str, capability: str, slots, session, db: Session) -> None:
+        if capability not in {"email_generate_draft", "email_read_thread"}:
+            return
+        if slots.slots_filled.get("contact_id") or slots.slots_filled.get("name_or_email"):
+            return
+        if not self._should_use_active_contact(message, capability):
+            return
+        active_contact_id = getattr(session, "active_contact_id", None)
+        contact = db.get(Contact, active_contact_id) if active_contact_id else None
+        if not contact or contact.deleted_at:
+            return
+        slots.slots_filled["contact_id"] = contact.id
+        slots.slots_missing = [slot for slot in slots.slots_missing if slot != "contact_id"]
+        slots.ready_to_execute = not slots.slots_missing
+
+    def _should_use_active_contact(self, message: str, capability: str) -> bool:
+        lowered = message.lower().strip()
+        continuation_terms = (
+            "another",
+            "same",
+            "that",
+            "this",
+            "he",
+            "she",
+            "him",
+            "her",
+            "them",
+            "their",
+            "follow",
+            "reply",
+            "response",
+            "continue",
+            "ask",
+            "asking",
+        )
+        if any(term in lowered for term in continuation_terms):
+            return True
+        return capability == "email_generate_draft" and lowered in {"generate a response", "draft a response", "write a reply"}
+
+    def _active_contact_id_from_evidence(self, evidence: list[EvidenceEnvelope], slots: dict, session, db: Session) -> str | None:
+        explicit_contact_id = slots.get("contact_id")
+        if explicit_contact_id:
+            return str(explicit_contact_id)
+        found: list[str] = []
+        for item in evidence:
+            for contact_id in self._contact_ids_from_data(item.data):
+                if contact_id not in found:
+                    found.append(contact_id)
+        if len(found) == 1:
+            contact = db.get(Contact, found[0])
+            if contact and not contact.deleted_at:
+                return contact.id
+        current = getattr(session, "active_contact_id", None)
+        if current and current in found:
+            return current
+        return current
+
+    def _contact_ids_from_data(self, data: dict) -> list[str]:
+        found: list[str] = []
+        contact_id = data.get("contact_id")
+        if contact_id:
+            found.append(str(contact_id))
+        contact = data.get("contact")
+        if isinstance(contact, dict) and contact.get("id"):
+            found.append(str(contact["id"]))
+        for item in data.get("items") or []:
+            if isinstance(item, dict) and item.get("contact_id"):
+                found.append(str(item["contact_id"]))
+            if isinstance(item, dict) and item.get("id") and data.get("status") in {"resolved", "needs_clarification"}:
+                found.append(str(item["id"]))
+        return found
+
+    def _remember_single_contact_from_text(self, text: str, session, db: Session) -> None:
+        emails: list[str] = []
+        for email in re.findall(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", text):
+            normalized = email.strip().lower()
+            if normalized not in emails:
+                emails.append(normalized)
+        if len(emails) != 1:
+            contact = self._single_contact_named_in_text(text, db)
+            if contact:
+                session.active_contact_id = contact.id
+            return
+        contact = db.query(Contact).filter(Contact.email == emails[0], Contact.deleted_at.is_(None)).first()
+        if contact:
+            session.active_contact_id = contact.id
+
+    def _single_contact_named_in_text(self, text: str, db: Session) -> Contact | None:
+        lowered = text.lower()
+        matches: dict[str, Contact] = {}
+        contacts = db.query(Contact).filter(Contact.deleted_at.is_(None)).all()
+        for contact in contacts:
+            labels = [contact.creator_name, contact.business_name]
+            for label in labels:
+                label_text = " ".join(str(label or "").lower().split())
+                if len(label_text) < 3:
+                    continue
+                if re.search(r"\b" + re.escape(label_text) + r"\b", lowered):
+                    matches[contact.id] = contact
+        if len(matches) == 1:
+            return next(iter(matches.values()))
+        return None
+
     def _contact_clarification_message(self, capability: str, slots: dict, db: Session) -> tuple[str, dict]:
         next_slots = dict(slots)
         candidates = self._contact_candidates_for_pending_task(capability, db)
@@ -605,6 +714,8 @@ class AgentService:
 
     def _contextual_reply_status(self, message: str, session, db: Session) -> str | None:
         lowered = message.lower().strip()
+        if _looks_like_reply_draft_request(lowered):
+            return None
         if not (("reply" in lowered or "respond" in lowered) and any(word in lowered for word in ("pending", "back", "sent", "still", "did", "have"))):
             return None
         pending_notice = self._pending_action_status_notice(session, db)
@@ -716,6 +827,7 @@ class AgentService:
                 "context_summary": getattr(session, "context_summary", None),
                 "context_loaded_at": getattr(session, "context_loaded_at", None),
                 "contact_name_map": getattr(session, "contact_name_map", None),
+                "active_contact_id": getattr(session, "active_contact_id", None),
             },
             db,
         )
@@ -769,12 +881,16 @@ class AgentService:
             "who have i responded",
             "who did i respond",
             "i have responded",
+            "who all did i send",
+            "who did i send",
+            "whom did i send",
+            "which contacts did i send",
         )
         if any(phrase in lowered for phrase in awareness_phrases):
             return "awareness"
         if any(phrase in lowered for phrase in ("send it", "send draft", "send email", "confirm send", "approve", "suppress", "cancel", "activate", "delete")):
             return "action"
-        if any(phrase in lowered for phrase in ("generate", "compose", "draft", "thread", "conversation", "most recent message", "latest message", "what did", "current status", "currently suppressed", "is suppressed", "queue", "follow", "autonomous")):
+        if any(phrase in lowered for phrase in ("generate", "compose", "draft", "thread", "conversation", "most recent message", "latest message", "what did", "current status", "currently suppressed", "is suppressed", "queue", "follow", "autonomous", "reply them back", "reply him back", "reply her back", "reply back", "write a reply")):
             return "task"
         if "who replied today" in lowered or "replied today" in lowered or "how many contacts replied" in lowered:
             return "task"
@@ -794,3 +910,26 @@ def _prepare_agent_message(message: str) -> str:
     identifier_text = f"\nReferenced identifiers: {' '.join(identifiers[:10])}" if identifiers else ""
     bounded = f"{head}\n...[message truncated; tail preserved]...\n{tail}{identifier_text}"
     return sanitize_text(bounded, limit=MAX_AGENT_MESSAGE_CHARS + 500)
+
+
+def _looks_like_reply_draft_request(lowered: str) -> bool:
+    status_question = lowered.startswith(("did ", "have ", "has ", "is ", "are ")) or "pending" in lowered or "already" in lowered
+    action_request = any(word in lowered for word in ("can you", "can u", "please", "write", "draft", "generate", "create", "prepare"))
+    if status_question and not action_request:
+        return False
+    if action_request and any(word in lowered for word in ("reply", "response", "follow-up", "follow up")):
+        return True
+    return any(
+        phrase in lowered
+        for phrase in (
+            "reply them back",
+            "reply him back",
+            "reply her back",
+            "reply back",
+            "write a reply",
+            "draft a reply",
+            "generate a reply",
+            "generate a response",
+            "draft a response",
+        )
+    )

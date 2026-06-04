@@ -35,11 +35,13 @@ def _capability_from_text(lowered: str) -> str:
         return "email_generate_draft"
     if "draft" in lowered and "follow" in lowered:
         return "email_generate_draft"
+    if _is_followup_draft_request(lowered):
+        return "email_generate_draft"
     if any(phrase in lowered for phrase in ("current status", "currently suppressed", "is suppressed", "suppression")):
         return "contact_resolve"
     if "autonomous" in lowered and "repl" in lowered:
         return "queue_status"
-    if any(phrase in lowered for phrase in ("most recent message", "latest message", "what did")) and any(
+    if any(phrase in lowered for phrase in ("most recent message", "latest message", "what did", "read reply from", "reply from")) and any(
         word in lowered for word in ("say", "said", "message", "reply")
     ):
         return "email_read_thread"
@@ -51,7 +53,7 @@ def _capability_from_text(lowered: str) -> str:
         return "followup_status"
     if lowered.startswith(("find ", "resolve ", "search contact")) or "contact" in lowered and "thread" not in lowered:
         return "contact_resolve"
-    if any(phrase in lowered for phrase in ("generate", "draft", "write a reply", "reply for")):
+    if any(phrase in lowered for phrase in ("generate", "draft", "dradt", "write a reply", "reply for", "reply them back", "reply him back", "reply her back")):
         return "email_generate_draft"
     if any(phrase in lowered for phrase in ("send it", "send draft", "send email", "confirm send")):
         return "email_send_draft"
@@ -60,3 +62,27 @@ def _capability_from_text(lowered: str) -> str:
     if "search" in lowered:
         return "email_search_thread"
     return "unsupported"
+
+
+def _is_followup_draft_request(lowered: str) -> bool:
+    if "follow" not in lowered:
+        return False
+    question_starts = ("who ", "whom ", "which ", "what ", "how many ", "show ", "list ")
+    if lowered.startswith(question_starts) and "asking" not in lowered and "ask " not in lowered:
+        return False
+    return any(
+        phrase in lowered
+        for phrase in (
+            "send another",
+            "send a follow",
+            "send follow",
+            "another follow",
+            "write a follow",
+            "compose a follow",
+            "draft a follow",
+            "asking",
+            "ask ",
+            "meet",
+            "discuss",
+        )
+    )

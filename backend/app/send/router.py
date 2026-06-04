@@ -21,7 +21,7 @@ class QueueCreate(BaseModel):
 @router.get("")
 def list_queue(db: Session = Depends(get_db)):
     items = db.query(SendQueue).order_by(SendQueue.created_at.asc()).all()
-    return {"items": [queue_to_dict(item) for item in items], "total": len(items)}
+    return {"items": [queue_to_dict(item, db) for item in items], "total": len(items)}
 
 
 @router.post("")
@@ -29,7 +29,7 @@ def create_queue(payload: QueueCreate, background_tasks: BackgroundTasks, db: Se
     entry = create_queue_entry(db, payload.contact_id, payload.draft_id, payload.sequence_num)
     db.commit()
     schedule_auto_process(background_tasks)
-    return queue_to_dict(entry)
+    return queue_to_dict(entry, db)
 
 
 @router.get("/{queue_id}")
@@ -37,7 +37,7 @@ def get_queue(queue_id: str, db: Session = Depends(get_db)):
     entry = db.get(SendQueue, queue_id)
     if not entry:
         raise HTTPException(status_code=404, detail="queue entry not found")
-    return queue_to_dict(entry)
+    return queue_to_dict(entry, db)
 
 
 @router.post("/process")
