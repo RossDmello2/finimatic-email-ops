@@ -15,9 +15,9 @@ from app.ai.prompts import (
     sender_profile_from_settings,
     system_prompt,
 )
-from app.ai.schema import DraftSuggestion
+from app.ai.schema import AIFailure, DraftSuggestion
 from app.conversations.router import ConversationGenerate, _conversation_prompt, _sanitize_conversation_result
-from app.db.models import Contact, ConversationMessage, SendAttempt, SendQueue, Suppression
+from app.db.models import Contact, ConversationMessage, Draft, SendAttempt, SendQueue, Suppression
 from app.db.session import SessionLocal
 from app.replies.imap_fetcher import IMAPReplyFetcher
 from app.replies.service import create_reply_record
@@ -304,6 +304,24 @@ def test_groq_model_setting_is_used_in_audit_payload(client, monkeypatch):
     assert event["payload"]["model"] == "llama-3.1-8b-instant"
 
 
+def test_groq_model_alias_is_canonicalized_in_settings_and_audit(client, monkeypatch):
+    monkeypatch.setenv("FINIMATIC_FAKE_AI", "1")
+    configure_sender(client, canary_verified=True)
+    settings = client.post("/api/settings", json={"groq_model": "gpt-oss-20b"}).json()
+    contact = client.post(
+        "/api/contacts",
+        json={"email": "model-alias@example.com", "creator_name": "Model Alias", "source": "manual"},
+    ).json()
+
+    response = client.post("/api/drafts/generate", json={"contact_id": contact["id"], "provider": "groq"}).json()
+
+    assert settings["groq_model"] == "openai/gpt-oss-20b"
+    assert client.get("/api/settings").json()["groq_model"] == "openai/gpt-oss-20b"
+    assert response["ai_model"] == "openai/gpt-oss-20b"
+    event = [row for row in client.get("/api/audit").json()["items"] if row["event_type"] == "draft.ai_generated"][-1]
+    assert event["payload"]["model"] == "openai/gpt-oss-20b"
+
+
 def test_groq_draft_generation_rotates_after_rate_limit(monkeypatch):
     calls = []
 
@@ -340,6 +358,26 @@ def test_groq_draft_generation_rotates_after_rate_limit(monkeypatch):
     assert isinstance(result, DraftSuggestion)
     assert result.subject == "Recovered"
     assert calls == ["key-one", "key-two"]
+
+
+def test_groq_model_rejection_returns_model_not_supported(monkeypatch):
+    class FakeCompletions:
+        def create(self, **kwargs):
+            assert kwargs["model"] == "openai/gpt-oss-20b"
+            raise RuntimeError("400 model gpt-oss-20b does not exist")
+
+    class FakeGroq:
+        def __init__(self, api_key):
+            self.chat = types.SimpleNamespace(completions=FakeCompletions())
+
+    monkeypatch.setitem(sys.modules, "groq", types.SimpleNamespace(Groq=FakeGroq))
+    gateway = AIGateway(["key-one"], [], groq_model="gpt-oss-20b")
+    contact = Contact(email="model-reject@example.com", creator_name="Model Reject", source="manual")
+
+    result = asyncio.run(gateway._call_groq(contact, "professional", "medium"))
+
+    assert isinstance(result, AIFailure)
+    assert result.error_code == "model_not_supported"
 
 
 def test_subject_variant_parser_accepts_line_separated_output():
@@ -663,7 +701,7 @@ def test_bulk_generation_and_bulk_approval_queue_contacts(client, monkeypatch):
 
 
 def test_template_create_from_approved_draft(client):
-    configure_sender(client, canary_verified=True)
+    configure_sender(client, canary_verified=True, dry_run=False)
     contact, draft = _make_contact_and_draft(client, email="template@example.com")
     client.post(f"/api/drafts/{draft['id']}/approve")
 
@@ -686,6 +724,47 @@ def _make_contact_and_draft(client, email="lead@example.com"):
     return contact, draft
 
 
+def _queue_approved_draft_without_sending(client, contact_id: str, draft_id: str, sequence_num: int = 1):
+    with SessionLocal() as db:
+        draft = db.get(Draft, draft_id)
+        draft.approved = True
+        draft.approved_at = datetime.now(timezone.utc)
+        db.commit()
+    return client.post(
+        "/api/queue",
+        json={"contact_id": contact_id, "draft_id": draft_id, "sequence_num": sequence_num},
+    ).json()
+
+
+def test_single_draft_approval_sends_immediately_with_fake_transport(client):
+    configure_sender(client, canary_verified=True, dry_run=False)
+    contact, draft = _make_contact_and_draft(client, email="direct-send@example.com")
+
+    response = client.post(f"/api/drafts/{draft['id']}/approve").json()
+    queue = client.get(f"/api/queue/{response['queue_id']}").json()
+
+    assert response["delivery_status"] == "sent"
+    assert queue["status"] == "sent"
+    assert len(client.app.state.transport.sent) == 1
+    assert client.app.state.transport.sent[0]["to"] == contact["email"]
+
+
+def test_dry_run_blocks_single_draft_approval_without_queue_or_attempt(client):
+    configure_sender(client, canary_verified=True, dry_run=True)
+    _contact, draft = _make_contact_and_draft(client, email="dry-run-direct@example.com")
+
+    response = client.post(f"/api/drafts/{draft['id']}/approve")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["reason"] == "DRY_RUN_ENABLED"
+    assert "Live mode is required" in response.json()["detail"]["message"]
+    assert client.get("/api/queue").json()["total"] == 0
+    with SessionLocal() as db:
+        stored = db.get(Draft, draft["id"])
+        assert stored.approved is False
+        assert db.query(SendAttempt).count() == 0
+
+
 def test_policy_blocks_unapproved_draft_and_records_reason(client):
     configure_sender(client, canary_verified=True, dry_run=False)
     contact, draft = _make_contact_and_draft(client)
@@ -703,6 +782,7 @@ def test_policy_blocks_unapproved_draft_and_records_reason(client):
 
 
 def test_approving_second_sequence_one_draft_returns_conflict(client):
+    configure_sender(client, canary_verified=True, dry_run=False)
     contact = client.post(
         "/api/contacts",
         json={"email": "duplicate-sequence@example.com", "creator_name": "Duplicate Sequence", "source": "manual"},
@@ -715,10 +795,11 @@ def test_approving_second_sequence_one_draft_returns_conflict(client):
 
     assert approved.status_code == 200
     assert duplicate.status_code == 409
-    assert duplicate.json()["detail"]["reason"] == "sequence_already_queued"
+    assert duplicate.json()["detail"]["reason"] == "sequence_already_sent"
 
 
 def test_approving_after_failed_sequence_one_queue_requeues_new_draft(client):
+    configure_sender(client, canary_verified=True, dry_run=False)
     contact = client.post(
         "/api/contacts",
         json={"email": "failed-retry@example.com", "creator_name": "Failed Retry", "source": "manual"},
@@ -740,13 +821,14 @@ def test_approving_after_failed_sequence_one_queue_requeues_new_draft(client):
     with SessionLocal() as db:
         queue = db.get(SendQueue, queue_id)
         assert queue.draft_id == second["id"]
-        assert queue.status == "pending"
+        assert queue.status == "sent"
         assert json.loads(queue.policy_block_reasons) == []
     event_types = [row["event_type"] for row in client.get("/api/audit").json()["items"]]
     assert "queue.entry_requeued" in event_types
 
 
 def test_approving_followup_after_sent_sequence_queues_next_sequence(client):
+    configure_sender(client, canary_verified=True, dry_run=False)
     contact = client.post(
         "/api/contacts",
         json={"email": "sent-followup@example.com", "creator_name": "Sent Followup", "source": "manual"},
@@ -771,7 +853,7 @@ def test_approving_followup_after_sent_sequence_queues_next_sequence(client):
         assert row.contact_id == contact["id"]
         assert row.draft_id == second["id"]
         assert row.sequence_num == 2
-        assert row.status == "pending"
+        assert row.status == "sent"
 
 
 def test_policy_blocks_suppressed_paused_replied_bounced_caps_and_idempotency(client):
@@ -786,7 +868,6 @@ def test_policy_blocks_suppressed_paused_replied_bounced_caps_and_idempotency(cl
 
     for email, setup, reason in cases:
         contact, draft = _make_contact_and_draft(client, email=email)
-        client.post(f"/api/drafts/{draft['id']}/approve")
         if setup == "suppression":
             client.post("/api/suppressions", json={"email": email, "reason": "manual"})
         elif setup == "status":
@@ -802,15 +883,14 @@ def test_policy_blocks_suppressed_paused_replied_bounced_caps_and_idempotency(cl
                 json={"contact_id": contact["id"], "classified_as": "bounce", "raw_summary": "manual"},
             )
 
-        entry = client.get("/api/queue").json()["items"][-1]
+        entry = _queue_approved_draft_without_sending(client, contact["id"], draft["id"])
         client.post("/api/queue/process")
         checked = client.get(f"/api/queue/{entry['id']}").json()
         assert reason in checked["policy_block_reasons"]
 
     client.post("/api/settings", json={"daily_send_cap": 0, "hourly_send_cap": 0})
     contact, draft = _make_contact_and_draft(client, email="cap@example.com")
-    client.post(f"/api/drafts/{draft['id']}/approve")
-    cap_entry = client.get("/api/queue").json()["items"][-1]
+    cap_entry = _queue_approved_draft_without_sending(client, contact["id"], draft["id"])
     client.post("/api/queue/process")
     cap_checked = client.get(f"/api/queue/{cap_entry['id']}").json()
     assert "DAILY_CAP_EXCEEDED" in cap_checked["policy_block_reasons"]
@@ -836,13 +916,11 @@ def test_policy_allows_imported_reengagement_after_suppression_removed(client):
         db_contact.status = "imported"
         db.commit()
 
-    client.post(f"/api/drafts/{draft['id']}/approve")
-    entry = client.get("/api/queue").json()["items"][-1]
-
-    processed = client.post("/api/queue/process").json()
+    approved = client.post(f"/api/drafts/{draft['id']}/approve").json()
+    entry = client.get(f"/api/queue/{approved['queue_id']}").json()
     checked = client.get(f"/api/queue/{entry['id']}").json()
 
-    assert processed["processed"] == 1
+    assert approved["delivery_status"] == "sent"
     assert checked["status"] == "sent"
     assert "RECIPIENT_REPLIED" not in checked["policy_block_reasons"]
     assert "RECIPIENT_SUPPRESSED" not in checked["policy_block_reasons"]
@@ -851,12 +929,17 @@ def test_policy_allows_imported_reengagement_after_suppression_removed(client):
 def test_dry_run_skips_then_same_queue_sends_when_live(client):
     configure_sender(client, canary_verified=True, dry_run=True)
     contact, draft = _make_contact_and_draft(client)
-    client.post(f"/api/drafts/{draft['id']}/approve")
-    entry = client.get("/api/queue").json()["items"][-1]
+    entry = _queue_approved_draft_without_sending(client, contact["id"], draft["id"])
 
-    client.post("/api/queue/process")
-    skipped = client.get(f"/api/queue/{entry['id']}").json()
-    assert skipped["status"] == "skipped"
+    first = client.post("/api/queue/process").json()
+    checked = client.get(f"/api/queue/{entry['id']}").json()
+    second = client.post("/api/queue/process").json()
+
+    assert first["skipped"] == 1
+    assert second["processed"] == 0
+    assert checked["status"] == "skipped"
+    assert checked["policy_block_reasons"] == ["DRY_RUN_ENABLED"]
+    assert checked["last_attempt_error_code"] == "DRY_RUN_ENABLED"
     assert len(client.app.state.transport.sent) == 0
 
     client.post("/api/settings", json={"dry_run": False})
@@ -868,9 +951,8 @@ def test_dry_run_skips_then_same_queue_sends_when_live(client):
 
 def test_queue_worker_skips_entries_claimed_by_another_worker(client):
     configure_sender(client, canary_verified=True, dry_run=False)
-    _contact, draft = _make_contact_and_draft(client, email="claimed-worker@example.com")
-    client.post(f"/api/drafts/{draft['id']}/approve")
-    entry = client.get("/api/queue").json()["items"][-1]
+    contact, draft = _make_contact_and_draft(client, email="claimed-worker@example.com")
+    entry = _queue_approved_draft_without_sending(client, contact["id"], draft["id"])
     with SessionLocal() as db:
         row = db.get(SendQueue, entry["id"])
         row.status = "processing"
@@ -891,12 +973,11 @@ def test_send_window_closed_defers_without_permanent_block(client):
     end = (now + timedelta(hours=3)).strftime("%H:%M")
     client.post("/api/settings", json={"send_window_start": start, "send_window_end": end, "send_timezone": "UTC"})
     contact, draft = _make_contact_and_draft(client, email="window@example.com")
-    client.post(f"/api/drafts/{draft['id']}/approve")
-    entry = client.get("/api/queue").json()["items"][-1]
+    approved = client.post(f"/api/drafts/{draft['id']}/approve").json()
+    processed = approved["delivery_result"]
+    checked = client.get(f"/api/queue/{approved['queue_id']}").json()
 
-    processed = client.post("/api/queue/process").json()
-    checked = client.get(f"/api/queue/{entry['id']}").json()
-
+    assert approved["delivery_status"] == "deferred"
     assert processed["processed"] == 1
     assert processed["deferred"] == 1
     assert checked["status"] == "pending"

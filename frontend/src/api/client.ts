@@ -57,7 +57,7 @@ export const api = {
   updateDraft: (id: string, payload: Record<string, unknown>) =>
     request<Draft>(`/api/drafts/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   approveDraft: (id: string, payload?: { sequence_num?: number }) =>
-    request<Draft & { queue_id: string }>(`/api/drafts/${id}/approve`, {
+    request<ApprovalResponse>(`/api/drafts/${id}/approve`, {
       method: "POST",
       ...(payload ? { body: JSON.stringify(payload) } : {})
     }),
@@ -72,10 +72,10 @@ export const api = {
   createTemplate: (payload: Record<string, unknown>) =>
     request<TemplateRow>("/api/templates", { method: "POST", body: JSON.stringify(payload) }),
   listQueue: () => request<ListResponse<QueueEntry>>("/api/queue"),
-  processQueue: () => request<{ processed: number; sent: number; blocked: number; skipped: number; deferred?: number }>("/api/queue/process", { method: "POST" }),
+  processQueue: () => request<QueueProcessResult>("/api/queue/process", { method: "POST" }),
   listFollowups: () => request<ListResponse<Followup>>("/api/followups"),
   processFollowups: () => request<{ processed: number; stopped: number; dispatched: number; skipped: number }>("/api/followups/process", { method: "POST" }),
-  approveFollowupDraft: (id: string) => request<{ status: string; queue_id: string }>(`/api/followups/${id}/approve-draft`, { method: "POST" }),
+  approveFollowupDraft: (id: string) => request<FollowupApprovalResponse>(`/api/followups/${id}/approve-draft`, { method: "POST" }),
   patchFollowup: (id: string, payload: Record<string, unknown>) =>
     request<Followup>(`/api/followups/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   listCampaigns: () => request<ListResponse<CampaignPlan>>("/api/campaigns"),
@@ -195,7 +195,36 @@ export type Contact = {
 export type Draft = { id: string; contact_id: string; subject: string; body: string; warnings: string[]; source?: string | null; rejected?: boolean; approved: boolean; approved_at?: string | null; ai_provider?: string | null; ai_model?: string | null; error_code?: string | null };
 export type BulkJob = { job_id: string; status: string; total: number; completed: number; generated: number; failed: number; skipped: number; errors?: string[] };
 export type TemplateRow = { id: string; name: string; subject_template: string; body_template: string; created_at?: string | null };
-export type QueueEntry = { id: string; contact_id: string; contact_email?: string | null; contact_name?: string | null; draft_id: string; draft_subject?: string | null; sequence_num: number; status: string; policy_block_reasons: string[]; scheduled_at: string };
+export type QueueProcessResult = { processed: number; sent: number; blocked: number; skipped: number; deferred?: number };
+export type DeliveryStatus = "sent" | "deferred" | "blocked" | "dry_run_blocked" | "queued_for_bulk" | "queued" | "failed" | string;
+export type QueueEntry = {
+  id: string;
+  contact_id: string;
+  contact_email?: string | null;
+  contact_name?: string | null;
+  draft_id: string;
+  draft_subject?: string | null;
+  sequence_num: number;
+  status: string;
+  policy_block_reasons: string[];
+  scheduled_at: string;
+  last_attempt_status?: string | null;
+  last_attempt_error_code?: string | null;
+  last_attempt_error_detail?: string | null;
+};
+export type ApprovalResponse = Draft & {
+  queue_id?: string | null;
+  queue?: QueueEntry | null;
+  delivery_status?: DeliveryStatus;
+  delivery_result?: QueueProcessResult;
+};
+export type FollowupApprovalResponse = {
+  status: string;
+  queue_id: string;
+  queue?: QueueEntry | null;
+  delivery_status?: DeliveryStatus;
+  delivery_result?: QueueProcessResult;
+};
 export type PendingFollowupDraft = { id: string; subject: string; body: string; approved: boolean };
 export type Followup = { id: string; contact_id: string; contact_email?: string | null; contact_name?: string | null; sequence_num: number; status: string; stop_reason?: string | null; due_at: string; draft_id?: string | null; pending_draft_id?: string | null; pending_draft?: PendingFollowupDraft | null };
 export type Suppression = { id: string; email: string; reason: string; source?: string };

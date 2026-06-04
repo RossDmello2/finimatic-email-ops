@@ -9,6 +9,7 @@ from typing import Literal
 from app.ai.gemini_pool import GEMINI_MODEL_DEFAULT
 from pydantic import ValidationError
 
+from app.ai.model_ids import normalize_groq_model
 from app.ai.prompts import SenderProfile, draft_user_prompt, system_prompt
 from app.ai.schema import AIFailure, DraftSuggestion
 from app.db.models import Contact, Draft
@@ -167,7 +168,7 @@ class AIGateway:
         self.gemini_keys = gemini_keys
         self.campaign_context = campaign_context
         self.sender_profile = sender_profile
-        self.groq_model = (groq_model or GROQ_MODEL_DEFAULT).strip() or GROQ_MODEL_DEFAULT
+        self.groq_model = normalize_groq_model(groq_model, GROQ_MODEL_DEFAULT)
         self.gemini_model = (gemini_model or GEMINI_MODEL_DEFAULT).strip() or GEMINI_MODEL_DEFAULT
 
     def _parse_suggestion(self, raw: str, provider: str) -> DraftSuggestion | AIFailure:
@@ -387,7 +388,7 @@ class AIGateway:
                 if "429" in str(exc) or "rate" in str(exc).lower():
                     rate_limited += 1
                     continue
-                return AIFailure(error_code="transport_error", provider="groq", detail=last_error)
+                return AIFailure(error_code=_groq_error_code(exc), provider="groq", detail=last_error)
             parsed = self._parse_suggestion(raw, "groq")
             if isinstance(parsed, DraftSuggestion):
                 return self._sanitize_contact_grounding(contact, parsed)
@@ -471,7 +472,7 @@ class AIGateway:
         try:
             raw = await asyncio.to_thread(call)
         except Exception as exc:
-            return AIFailure(error_code="transport_error", provider="groq", detail=exc.__class__.__name__)
+            return AIFailure(error_code=_groq_error_code(exc), provider="groq", detail=exc.__class__.__name__)
         variants = self._parse_subject_variants(raw)
         if len(variants) < 3:
             return AIFailure(error_code="malformed_output", provider="groq", detail="too_few_variants")
@@ -546,3 +547,22 @@ class AIGateway:
         except Exception:
             return None
         return text[:1000] or None
+
+
+def _groq_error_code(exc: Exception) -> str:
+    text = str(exc).lower()
+    if "model" in text and any(
+        marker in text
+        for marker in (
+            "not found",
+            "not exist",
+            "does not exist",
+            "invalid",
+            "unsupported",
+            "decommission",
+            "unavailable",
+            "400",
+        )
+    ):
+        return "model_not_supported"
+    return "transport_error"

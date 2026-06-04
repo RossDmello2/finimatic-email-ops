@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.ai.key_utils import fingerprints, parse_keys
+from app.ai.model_ids import normalize_groq_model
 from app.audit.service import emit_event
 from app.core.crypto import decrypt_secret, encrypt_secret
 from app.db.models import Setting
@@ -167,6 +168,8 @@ def set_settings(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
                 stored = str(value)
             if key == "gemini_model":
                 stored = "gemini-2.5-flash"
+            if key == "groq_model":
+                stored = normalize_groq_model(stored, DEFAULT_SETTINGS["groq_model"])
             if key == "email_transport" and stored not in {"smtp", "gmail_api"}:
                 stored = DEFAULT_SETTINGS["email_transport"]
             if key == "auto_reply_mode" and stored not in {"propose", "autonomous"}:
@@ -223,7 +226,7 @@ def settings_read(db: Session) -> dict[str, Any]:
         "sender_offer": get_value(db, "sender_offer"),
         "sender_tone": get_value(db, "sender_tone", DEFAULT_SETTINGS["sender_tone"]),
         "sender_signature": get_value(db, "sender_signature"),
-        "groq_model": get_value(db, "groq_model", DEFAULT_SETTINGS["groq_model"]),
+        "groq_model": normalize_groq_model(get_value(db, "groq_model", DEFAULT_SETTINGS["groq_model"]), DEFAULT_SETTINGS["groq_model"]),
         "gemini_model": DEFAULT_SETTINGS["gemini_model"],
         "follow_up_template_1": get_value(db, "follow_up_template_1", DEFAULT_SETTINGS["follow_up_template_1"]),
         "follow_up_template_2": get_value(db, "follow_up_template_2", DEFAULT_SETTINGS["follow_up_template_2"]),

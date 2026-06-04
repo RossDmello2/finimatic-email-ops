@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.audit.service import emit_event
 from app.ai.gateway import GROQ_MODEL_DEFAULT
+from app.ai.model_ids import normalize_groq_model
 from app.ai.prompts import custom_field_context, sender_profile_from_settings
 from app.contacts.utils import is_domain_blocked, resolve_tokens
 from app.core.time import utcnow
@@ -136,8 +137,9 @@ def _make_followup_draft(db: Session, contact: Contact, sequence_num: int) -> Dr
             from groq import Groq
 
             client = Groq(api_key=keys[0])
+            groq_model = normalize_groq_model(get_value(db, "groq_model", GROQ_MODEL_DEFAULT), GROQ_MODEL_DEFAULT)
             response = client.chat.completions.create(
-                model=get_value(db, "groq_model", GROQ_MODEL_DEFAULT),
+                model=groq_model,
                 messages=[
                     {
                         "role": "user",
@@ -167,7 +169,7 @@ def _make_followup_draft(db: Session, contact: Contact, sequence_num: int) -> Dr
         subject=resolve_tokens(subject, contact),
         body=resolve_tokens(body, contact),
         ai_provider="groq" if keys else "manual",
-        ai_model=get_value(db, "groq_model", GROQ_MODEL_DEFAULT) if keys else None,
+        ai_model=normalize_groq_model(get_value(db, "groq_model", GROQ_MODEL_DEFAULT), GROQ_MODEL_DEFAULT) if keys else None,
         warnings=json.dumps([]),
         notes=f"followup_auto:seq{sequence_num}",
         approved=False,
@@ -254,7 +256,7 @@ def _schedule_next_followup(db: Session, contact_id: str, draft_id: str, current
     emit_event(db, "followup.due_calculated", entity_type="contact", entity_id=contact_id, payload={"sequence_num": next_sequence})
 
 
-def approve_followup_draft(db: Session, sequence_id: str) -> dict:
+def approve_followup_draft(db: Session, sequence_id: str, *, immediate: bool = False) -> dict:
     row = db.get(FollowUpSequence, sequence_id)
     if not row:
         raise ValueError("followup_not_found")
@@ -284,6 +286,8 @@ def approve_followup_draft(db: Session, sequence_id: str) -> dict:
     draft.approved = True
     draft.approved_at = utcnow()
     queue = create_queue_entry(db, row.contact_id, draft.id, row.sequence_num)
+    if immediate and queue.status in {"pending", "skipped"}:
+        queue.scheduled_at = utcnow()
     row.status = "dispatched"
     row.draft_id = draft.id
     emit_event(
@@ -293,7 +297,6 @@ def approve_followup_draft(db: Session, sequence_id: str) -> dict:
         entity_id=row.id,
         payload={"contact_id": row.contact_id, "sequence_num": row.sequence_num, "draft_id": draft.id, "queue_id": queue.id},
     )
-    _schedule_next_followup(db, row.contact_id, draft.id, row.sequence_num)
     db.commit()
     return {"status": "queued", "queue_id": queue.id}
 

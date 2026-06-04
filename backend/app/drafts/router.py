@@ -22,8 +22,8 @@ from app.core.time import iso, utcnow
 from app.db.models import Contact, Draft, SendQueue
 from app.db.session import SessionLocal, get_db
 from app.send.auto_process import schedule_auto_process
-from app.send.queue_worker import create_queue_entry
-from app.settings.service import get_int, get_key_list, get_value
+from app.send.queue_worker import create_queue_entry, process_pending_queue, queue_to_dict
+from app.settings.service import get_bool, get_int, get_key_list, get_value
 
 router = APIRouter(prefix="/api/drafts", tags=["drafts"])
 BULK_JOBS: dict[str, dict] = {}
@@ -130,7 +130,7 @@ def store_generated_draft(
     return draft
 
 
-def _queue_approved_draft(db: Session, draft: Draft, contact: Contact, sequence_num: int = 1) -> SendQueue:
+def _queue_approved_draft(db: Session, draft: Draft, contact: Contact, sequence_num: int = 1, *, immediate: bool = False) -> SendQueue:
     existing_queue = db.query(SendQueue).filter_by(contact_id=contact.id, sequence_num=sequence_num).first()
     if existing_queue and existing_queue.status not in REQUEUE_STATUSES:
         if existing_queue.draft_id != draft.id:
@@ -154,14 +154,52 @@ def _queue_approved_draft(db: Session, draft: Draft, contact: Contact, sequence_
         previous_status = existing_queue.status
         existing_queue.draft_id = draft.id
         existing_queue.idempotency_key = sha256_key(contact.id, sequence_num, draft.id)
-        existing_queue.scheduled_at = utcnow() + timedelta(seconds=delay) if delay > 0 else utcnow()
+        existing_queue.scheduled_at = utcnow() if immediate else utcnow() + timedelta(seconds=delay) if delay > 0 else utcnow()
         existing_queue.status = "pending"
         existing_queue.policy_block_reasons = json.dumps([])
         db.flush()
         emit_event(db, "queue.entry_requeued", entity_type="send_queue", entity_id=existing_queue.id, payload={"previous_status": previous_status})
         return existing_queue
 
-    return create_queue_entry(db, contact.id, draft.id, sequence_num)
+    queue = create_queue_entry(db, contact.id, draft.id, sequence_num)
+    if immediate and queue.status in {"pending", "skipped"}:
+        queue.scheduled_at = utcnow()
+        db.flush()
+    return queue
+
+
+def _dry_run_direct_send_error() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "reason": "DRY_RUN_ENABLED",
+            "message": "Live mode is required before approval can send email. Turn off Dry Run, then approve again.",
+        },
+    )
+
+
+def _delivery_status(result: dict, queue: SendQueue | None) -> str:
+    if result.get("sent"):
+        return "sent"
+    if result.get("deferred"):
+        return "deferred"
+    if result.get("blocked"):
+        return "blocked"
+    if result.get("skipped"):
+        return "dry_run_blocked"
+    if queue is None:
+        return "queued"
+    if queue.status == "sent":
+        return "sent"
+    if queue.status == "pending":
+        return "deferred"
+    if queue.status == "blocked":
+        return "blocked"
+    if queue.status == "skipped":
+        return "dry_run_blocked"
+    if queue.status == "failed":
+        return "failed"
+    return queue.status or "queued"
 
 
 @router.get("")
@@ -349,21 +387,32 @@ async def subject_variants(draft_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{draft_id}/approve")
-def approve_draft(draft_id: str, background_tasks: BackgroundTasks, payload: DraftApprove | None = None, db: Session = Depends(get_db)):
+async def approve_draft(draft_id: str, background_tasks: BackgroundTasks, payload: DraftApprove | None = None, db: Session = Depends(get_db)):
     draft = db.get(Draft, draft_id)
     if not draft:
         raise HTTPException(status_code=404, detail="draft not found")
-    draft.approved = True
-    draft.approved_at = utcnow()
     contact = db.get(Contact, draft.contact_id)
     if not contact or contact.deleted_at is not None:
         raise HTTPException(status_code=404, detail="contact not found")
-    contact.status = "approved"
     sequence_num = payload.sequence_num if payload and payload.sequence_num else 1
     if sequence_num < 1:
         raise HTTPException(status_code=422, detail="sequence_num must be >= 1")
-    queue = _queue_approved_draft(db, draft, contact, sequence_num)
+    if get_bool(db, "dry_run"):
+        raise _dry_run_direct_send_error()
+    draft.approved = True
+    draft.approved_at = utcnow()
+    contact.status = "approved"
+    queue = _queue_approved_draft(db, draft, contact, sequence_num, immediate=True)
     emit_event(db, "draft.approved", entity_type="draft", entity_id=draft.id, payload={"queue_id": queue.id, "sequence_num": sequence_num})
     db.commit()
-    schedule_auto_process(background_tasks)
-    return {**draft_to_dict(draft), "queue_id": queue.id}
+    result = await process_pending_queue(db, queue_ids=[queue.id])
+    db.expire_all()
+    queue = db.get(SendQueue, queue.id)
+    draft = db.get(Draft, draft_id)
+    return {
+        **draft_to_dict(draft),
+        "queue_id": queue.id if queue else None,
+        "queue": queue_to_dict(queue, db) if queue else None,
+        "delivery_status": _delivery_status(result, queue),
+        "delivery_result": result,
+    }

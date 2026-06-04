@@ -16,12 +16,29 @@ from app.send.smtp_adapter import GmailAdapter
 from app.settings.service import get_bool, get_int, get_secret, get_value
 
 TEMPORARY_BLOCK_REASONS = {"SEND_WINDOW_NOT_ELAPSED"}
+DRY_RUN_REASON = "DRY_RUN_ENABLED"
 
 
-def queue_to_dict(entry: SendQueue) -> dict:
+def _latest_attempt_dict(db: Session, entry_id: str) -> dict:
+    attempt = (
+        db.query(SendAttempt)
+        .filter(SendAttempt.queue_id == entry_id)
+        .order_by(SendAttempt.sent_at.desc().nullslast(), SendAttempt.id.desc())
+        .first()
+    )
+    if not attempt:
+        return {"last_attempt_status": None, "last_attempt_error_code": None, "last_attempt_error_detail": None}
+    return {
+        "last_attempt_status": attempt.status,
+        "last_attempt_error_code": attempt.error_code,
+        "last_attempt_error_detail": attempt.error_detail,
+    }
+
+
+def queue_to_dict(entry: SendQueue, db: Session | None = None) -> dict:
     contact = entry.contact
     draft = entry.draft
-    return {
+    payload = {
         "id": entry.id,
         "contact_id": entry.contact_id,
         "contact_email": contact.email if contact else None,
@@ -35,6 +52,9 @@ def queue_to_dict(entry: SendQueue) -> dict:
         "policy_block_reasons": json.loads(entry.policy_block_reasons or "[]"),
         "created_at": entry.created_at.isoformat() if entry.created_at else None,
     }
+    if db is not None:
+        payload.update(_latest_attempt_dict(db, entry.id))
+    return payload
 
 
 def create_queue_entry(db: Session, contact_id: str, draft_id: str, sequence_num: int = 1) -> SendQueue:
@@ -103,14 +123,14 @@ def _next_retry_at(db: Session, now) -> object:
     return retry_at
 
 
-async def process_pending_queue(db: Session, transport=None) -> dict:
+async def process_pending_queue(db: Session, transport=None, queue_ids: list[str] | None = None) -> dict:
     now = utcnow()
-    entries = (
-        db.query(SendQueue)
-        .filter(SendQueue.status.in_(["pending", "skipped"]), SendQueue.scheduled_at <= now)
-        .order_by(SendQueue.created_at.asc())
-        .all()
-    )
+    dry_run_enabled = get_bool(db, "dry_run")
+    processable_statuses = ["pending"] if dry_run_enabled else ["pending", "skipped"]
+    query = db.query(SendQueue).filter(SendQueue.status.in_(processable_statuses), SendQueue.scheduled_at <= now)
+    if queue_ids is not None:
+        query = query.filter(SendQueue.id.in_(queue_ids))
+    entries = query.order_by(SendQueue.created_at.asc()).all()
     processed = 0
     sent = 0
     blocked = 0
@@ -121,7 +141,7 @@ async def process_pending_queue(db: Session, transport=None) -> dict:
     for entry in entries:
         claimed = (
             db.query(SendQueue)
-            .filter(SendQueue.id == entry.id, SendQueue.status.in_(["pending", "skipped"]))
+            .filter(SendQueue.id == entry.id, SendQueue.status.in_(processable_statuses))
             .update({"status": "processing"}, synchronize_session=False)
         )
         db.commit()
@@ -156,8 +176,9 @@ async def process_pending_queue(db: Session, transport=None) -> dict:
             db.commit()
             continue
 
-        if get_bool(db, "dry_run"):
+        if dry_run_enabled:
             entry.status = "skipped"
+            entry.policy_block_reasons = json.dumps([DRY_RUN_REASON])
             db.add(
                 SendAttempt(
                     queue_id=entry.id,
@@ -166,11 +187,11 @@ async def process_pending_queue(db: Session, transport=None) -> dict:
                     idempotency_key=entry.idempotency_key,
                     status="blocked_dry_run",
                     sender_identity=get_value(db, "gmail_user"),
-                    error_code="dry_run",
-                    error_detail="Dry run mode prevented SMTP send",
+                    error_code=DRY_RUN_REASON,
+                    error_detail="Live mode is required before real delivery.",
                 )
             )
-            emit_event(db, "send.dry_run_blocked", entity_type="send_queue", entity_id=entry.id)
+            emit_event(db, "send.dry_run_blocked", entity_type="send_queue", entity_id=entry.id, payload={"reasons": [DRY_RUN_REASON]})
             skipped += 1
             db.commit()
             continue

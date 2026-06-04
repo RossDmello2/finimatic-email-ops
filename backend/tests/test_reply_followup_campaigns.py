@@ -380,8 +380,8 @@ def test_followup_process_proposes_unapproved_draft(client):
         assert "AI Systems Engineer" in draft.body
 
 
-def test_followup_approve_draft_endpoint_queues(client):
-    _contact, sequence = _make_due_followup(client)
+def test_followup_approve_draft_endpoint_sends_immediately_and_schedules_next(client):
+    contact, sequence = _make_due_followup(client)
     client.post("/api/followups/process")
     pending = client.get(f"/api/followups/{sequence['id']}").json()
 
@@ -390,12 +390,34 @@ def test_followup_approve_draft_endpoint_queues(client):
 
     assert result.status_code == 200
     assert result.json()["status"] == "queued"
+    assert result.json()["delivery_status"] == "sent"
     assert updated["status"] == "dispatched"
     with SessionLocal() as db:
         draft = db.get(Draft, pending["pending_draft_id"])
         queue = db.get(SendQueue, result.json()["queue_id"])
+        next_sequence = db.query(FollowUpSequence).filter_by(contact_id=contact["id"], sequence_num=3).first()
         assert draft.approved is True
         assert queue.draft_id == draft.id
+        assert queue.status == "sent"
+        assert next_sequence is not None
+    assert len(client.app.state.transport.sent) == 2
+
+
+def test_followup_approval_dry_run_blocks_without_queueing(client):
+    contact, sequence = _make_due_followup(client)
+    client.post("/api/followups/process")
+    pending = client.get(f"/api/followups/{sequence['id']}").json()
+    client.post("/api/settings", json={"dry_run": True})
+
+    response = client.post(f"/api/followups/{sequence['id']}/approve-draft")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["reason"] == "DRY_RUN_ENABLED"
+    with SessionLocal() as db:
+        draft = db.get(Draft, pending["pending_draft_id"])
+        queue_count = db.query(SendQueue).filter(SendQueue.contact_id == contact["id"], SendQueue.sequence_num == 2).count()
+        assert draft.approved is False
+        assert queue_count == 0
 
 
 def test_reply_stops_pending_followup_approval(client):
