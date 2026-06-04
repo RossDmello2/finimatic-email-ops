@@ -1024,6 +1024,7 @@ th input[type="checkbox"] {
   gap: 2px;
   max-width: 100%;
   padding: 3px;
+  transition: border-color 150ms ease, box-shadow 150ms ease;
 }
 
 .segmented button {
@@ -1033,6 +1034,13 @@ th input[type="checkbox"] {
   font-weight: 700;
   min-height: 30px;
   padding: 0 0.75rem;
+  transition: background-color 150ms ease, color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+}
+
+.segmented button:not(:disabled):hover {
+  background: #eef5f4;
+  color: #0f766e;
+  transform: translateY(-1px);
 }
 
 .contact-segmented {
@@ -1052,7 +1060,12 @@ th input[type="checkbox"] {
 
 .segmented button.active {
   background: #0f766e;
+  box-shadow: 0 1px 4px rgba(15, 118, 110, 0.28);
   color: #ffffff;
+}
+
+.segmented button.active.saving {
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.16), 0 1px 4px rgba(15, 118, 110, 0.28);
 }
 
 .auto-reply-mode-row {
@@ -1061,6 +1074,7 @@ th input[type="checkbox"] {
   border: 1px solid #d8dde6;
   border-radius: 8px;
   display: flex;
+  flex-wrap: wrap;
   gap: 14px;
   justify-content: space-between;
   margin-bottom: 14px;
@@ -1076,6 +1090,22 @@ th input[type="checkbox"] {
   color: #64748b;
   font-size: 0.84rem;
   font-weight: 700;
+}
+
+.auto-reply-mode-row .mode-copy small {
+  color: #0f766e;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.auto-reply-mode-control {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.auto-reply-mode-control.saving {
+  border-color: #94c7c1;
+  box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.08);
 }
 
 .auto-reply-mode-control button {
