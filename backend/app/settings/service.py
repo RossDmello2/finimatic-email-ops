@@ -68,9 +68,13 @@ SECRET_KEYS = {"gmail_app_password", "gmail_api_client_id", "gmail_api_client_se
 
 
 def seed_settings(db: Session) -> None:
+    existing_keys = {
+        row[0]
+        for row in db.query(Setting.key).filter(Setting.key.in_(DEFAULT_SETTINGS.keys())).all()
+    }
     changed = False
     for key, value in DEFAULT_SETTINGS.items():
-        if not db.query(Setting).filter_by(key=key).first():
+        if key not in existing_keys:
             db.add(Setting(key=key, value=value))
             changed = True
     if changed:
@@ -141,6 +145,66 @@ def get_key_list(db: Session, key: str) -> list[str]:
     return [decrypt_secret(item) for item in encrypted if item]
 
 
+def _settings_snapshot(db: Session) -> dict[str, str]:
+    rows = db.query(Setting).filter(Setting.key.in_(DEFAULT_SETTINGS.keys())).all()
+    values = dict(DEFAULT_SETTINGS)
+    for row in rows:
+        if row.value is not None:
+            values[row.key] = row.value
+    return values
+
+
+def _snapshot_value(snapshot: dict[str, str], key: str, default: str = "") -> str:
+    return snapshot.get(key, default)
+
+
+def _snapshot_bool(snapshot: dict[str, str], key: str) -> bool:
+    return _snapshot_value(snapshot, key, "false").lower() == "true"
+
+
+def _snapshot_int(snapshot: dict[str, str], key: str) -> int:
+    try:
+        return int(_snapshot_value(snapshot, key, DEFAULT_SETTINGS.get(key, "0")))
+    except ValueError:
+        return int(DEFAULT_SETTINGS.get(key, "0"))
+
+
+def _snapshot_key_list(snapshot: dict[str, str], key: str) -> list[str]:
+    stored = _snapshot_value(snapshot, key, "[]")
+    try:
+        encrypted = json.loads(stored)
+    except json.JSONDecodeError:
+        return []
+    return [decrypt_secret(item) for item in encrypted if item]
+
+
+def _effective_daily_send_cap_from_snapshot(snapshot: dict[str, str]) -> int:
+    configured = _snapshot_int(snapshot, "daily_send_cap")
+    if not _snapshot_bool(snapshot, "warm_up_mode"):
+        return configured
+    start = _snapshot_value(snapshot, "warm_up_start_date")
+    try:
+        start_date = datetime.fromisoformat(start).date()
+    except ValueError:
+        start_date = datetime.now(timezone.utc).date()
+    day = (datetime.now(timezone.utc).date() - start_date).days + 1
+    if day <= 3:
+        return min(configured, 5)
+    if day <= 7:
+        return min(configured, 15)
+    if day <= 14:
+        return min(configured, 30)
+    return configured
+
+
+def _mode_label_from_snapshot(snapshot: dict[str, str]) -> str:
+    if _snapshot_bool(snapshot, "dry_run"):
+        return "DRY-RUN"
+    if not _snapshot_bool(snapshot, "canary_verified"):
+        return "CANARY"
+    return "LIVE"
+
+
 def set_settings(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
     seed_settings(db)
     changed_keys: list[str] = []
@@ -197,56 +261,57 @@ def set_settings(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
 
 def settings_read(db: Session) -> dict[str, Any]:
     seed_settings(db)
-    groq = get_key_list(db, "groq_keys")
-    gemini = get_key_list(db, "gemini_keys")
+    snapshot = _settings_snapshot(db)
+    groq = _snapshot_key_list(snapshot, "groq_keys")
+    gemini = _snapshot_key_list(snapshot, "gemini_keys")
     return {
-        "gmail_user": get_value(db, "gmail_user"),
-        "email_transport": get_value(db, "email_transport", DEFAULT_SETTINGS["email_transport"]),
-        "gmail_app_password_configured": bool(get_value(db, "gmail_app_password")),
+        "gmail_user": _snapshot_value(snapshot, "gmail_user"),
+        "email_transport": _snapshot_value(snapshot, "email_transport", DEFAULT_SETTINGS["email_transport"]),
+        "gmail_app_password_configured": bool(_snapshot_value(snapshot, "gmail_app_password")),
         "gmail_api_configured": all(
-            bool(get_value(db, key))
+            bool(_snapshot_value(snapshot, key))
             for key in ("gmail_api_client_id", "gmail_api_client_secret", "gmail_api_refresh_token")
         ),
-        "report_recipient": get_value(db, "report_recipient"),
+        "report_recipient": _snapshot_value(snapshot, "report_recipient"),
         "groq_keys_count": len(groq),
         "groq_keys_fingerprints": fingerprints(groq),
         "gemini_keys_count": len(gemini),
         "gemini_keys_fingerprints": fingerprints(gemini),
-        "daily_send_cap": get_int(db, "daily_send_cap"),
-        "hourly_send_cap": get_int(db, "hourly_send_cap"),
-        "send_delay_s": get_int(db, "send_delay_s"),
-        "auto_process_enabled": get_bool(db, "auto_process_enabled"),
-        "auto_process_queue_interval_seconds": get_int(db, "auto_process_queue_interval_seconds"),
-        "auto_process_followup_interval_seconds": get_int(db, "auto_process_followup_interval_seconds"),
-        "followup_interval_days": get_int(db, "followup_interval_days"),
-        "max_followups_per_lead": get_int(db, "max_followups_per_lead"),
-        "campaign_context": get_value(db, "campaign_context"),
-        "sender_name": get_value(db, "sender_name"),
-        "sender_role": get_value(db, "sender_role"),
-        "sender_offer": get_value(db, "sender_offer"),
-        "sender_tone": get_value(db, "sender_tone", DEFAULT_SETTINGS["sender_tone"]),
-        "sender_signature": get_value(db, "sender_signature"),
-        "groq_model": normalize_groq_model(get_value(db, "groq_model", DEFAULT_SETTINGS["groq_model"]), DEFAULT_SETTINGS["groq_model"]),
+        "daily_send_cap": _snapshot_int(snapshot, "daily_send_cap"),
+        "hourly_send_cap": _snapshot_int(snapshot, "hourly_send_cap"),
+        "send_delay_s": _snapshot_int(snapshot, "send_delay_s"),
+        "auto_process_enabled": _snapshot_bool(snapshot, "auto_process_enabled"),
+        "auto_process_queue_interval_seconds": _snapshot_int(snapshot, "auto_process_queue_interval_seconds"),
+        "auto_process_followup_interval_seconds": _snapshot_int(snapshot, "auto_process_followup_interval_seconds"),
+        "followup_interval_days": _snapshot_int(snapshot, "followup_interval_days"),
+        "max_followups_per_lead": _snapshot_int(snapshot, "max_followups_per_lead"),
+        "campaign_context": _snapshot_value(snapshot, "campaign_context"),
+        "sender_name": _snapshot_value(snapshot, "sender_name"),
+        "sender_role": _snapshot_value(snapshot, "sender_role"),
+        "sender_offer": _snapshot_value(snapshot, "sender_offer"),
+        "sender_tone": _snapshot_value(snapshot, "sender_tone", DEFAULT_SETTINGS["sender_tone"]),
+        "sender_signature": _snapshot_value(snapshot, "sender_signature"),
+        "groq_model": normalize_groq_model(_snapshot_value(snapshot, "groq_model", DEFAULT_SETTINGS["groq_model"]), DEFAULT_SETTINGS["groq_model"]),
         "gemini_model": DEFAULT_SETTINGS["gemini_model"],
-        "follow_up_template_1": get_value(db, "follow_up_template_1", DEFAULT_SETTINGS["follow_up_template_1"]),
-        "follow_up_template_2": get_value(db, "follow_up_template_2", DEFAULT_SETTINGS["follow_up_template_2"]),
-        "blocked_domains": get_value(db, "blocked_domains"),
-        "send_window_start": get_value(db, "send_window_start", DEFAULT_SETTINGS["send_window_start"]),
-        "send_window_end": get_value(db, "send_window_end", DEFAULT_SETTINGS["send_window_end"]),
-        "send_timezone": get_value(db, "send_timezone", DEFAULT_SETTINGS["send_timezone"]),
-        "warm_up_mode": get_bool(db, "warm_up_mode"),
-        "warm_up_start_date": get_value(db, "warm_up_start_date"),
-        "warm_up_current_limit": get_effective_daily_send_cap(db),
-        "imap_fetch_interval_minutes": get_int(db, "imap_fetch_interval_minutes"),
-        "auto_reply_enabled": get_bool(db, "auto_reply_enabled"),
-        "auto_reply_mode": get_value(db, "auto_reply_mode", DEFAULT_SETTINGS["auto_reply_mode"]),
-        "auto_reply_daily_cap": get_int(db, "auto_reply_daily_cap"),
-        "auto_reply_min_gap_minutes": get_int(db, "auto_reply_min_gap_minutes"),
-        "auto_reply_safe_intents": get_value(db, "auto_reply_safe_intents", DEFAULT_SETTINGS["auto_reply_safe_intents"]),
-        "dry_run": get_bool(db, "dry_run"),
-        "canary_verified": get_bool(db, "canary_verified"),
-        "sender_readiness": get_value(db, "sender_readiness", "not_configured"),
-        "mode": mode_label(db),
+        "follow_up_template_1": _snapshot_value(snapshot, "follow_up_template_1", DEFAULT_SETTINGS["follow_up_template_1"]),
+        "follow_up_template_2": _snapshot_value(snapshot, "follow_up_template_2", DEFAULT_SETTINGS["follow_up_template_2"]),
+        "blocked_domains": _snapshot_value(snapshot, "blocked_domains"),
+        "send_window_start": _snapshot_value(snapshot, "send_window_start", DEFAULT_SETTINGS["send_window_start"]),
+        "send_window_end": _snapshot_value(snapshot, "send_window_end", DEFAULT_SETTINGS["send_window_end"]),
+        "send_timezone": _snapshot_value(snapshot, "send_timezone", DEFAULT_SETTINGS["send_timezone"]),
+        "warm_up_mode": _snapshot_bool(snapshot, "warm_up_mode"),
+        "warm_up_start_date": _snapshot_value(snapshot, "warm_up_start_date"),
+        "warm_up_current_limit": _effective_daily_send_cap_from_snapshot(snapshot),
+        "imap_fetch_interval_minutes": _snapshot_int(snapshot, "imap_fetch_interval_minutes"),
+        "auto_reply_enabled": _snapshot_bool(snapshot, "auto_reply_enabled"),
+        "auto_reply_mode": _snapshot_value(snapshot, "auto_reply_mode", DEFAULT_SETTINGS["auto_reply_mode"]),
+        "auto_reply_daily_cap": _snapshot_int(snapshot, "auto_reply_daily_cap"),
+        "auto_reply_min_gap_minutes": _snapshot_int(snapshot, "auto_reply_min_gap_minutes"),
+        "auto_reply_safe_intents": _snapshot_value(snapshot, "auto_reply_safe_intents", DEFAULT_SETTINGS["auto_reply_safe_intents"]),
+        "dry_run": _snapshot_bool(snapshot, "dry_run"),
+        "canary_verified": _snapshot_bool(snapshot, "canary_verified"),
+        "sender_readiness": _snapshot_value(snapshot, "sender_readiness", "not_configured"),
+        "mode": _mode_label_from_snapshot(snapshot),
     }
 
 

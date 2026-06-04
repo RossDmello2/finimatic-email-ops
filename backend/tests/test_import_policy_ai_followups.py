@@ -700,6 +700,87 @@ def test_bulk_generation_and_bulk_approval_queue_contacts(client, monkeypatch):
     assert approved["queued"] == 2
 
 
+def _wait_for_bulk_job(client, job_id: str) -> dict:
+    status = {}
+    for _ in range(12):
+        status = client.get(f"/api/drafts/bulk-status/{job_id}").json()
+        if status["status"] == "completed":
+            return status
+        time.sleep(0.25)
+    return status
+
+
+def test_bulk_generation_template_only_resolves_contact_tokens(client):
+    configure_sender(client, canary_verified=True)
+    contacts = [
+        client.post(
+            "/api/contacts",
+            json={"email": "template-bulk-one@example.com", "creator_name": "Alex Rivera", "website_url": "https://alex.example", "source": "manual"},
+        ).json(),
+        client.post(
+            "/api/contacts",
+            json={"email": "template-bulk-two@example.com", "creator_name": "Nina Stone", "website_url": "https://nina.example", "source": "manual"},
+        ).json(),
+    ]
+    template = client.post(
+        "/api/templates",
+        json={
+            "name": "Template Bulk",
+            "subject_template": "Idea for {{first_name}}",
+            "body_template": "Hi {{first_name}}, I noticed {{website}} and thought this outreach structure could fit.",
+        },
+    ).json()
+
+    job = client.post(
+        "/api/drafts/generate-bulk",
+        json={"contact_ids": [contact["id"] for contact in contacts], "mode": "template_only", "template_id": template["id"]},
+    ).json()
+    status = _wait_for_bulk_job(client, job["job_id"])
+    drafts = client.get("/api/drafts").json()["items"]
+
+    assert status["status"] == "completed"
+    assert status["generated"] == 2
+    assert {draft["ai_provider"] for draft in drafts} == {"template"}
+    assert any(draft["subject"] == "Idea for Alex" and "https://alex.example" in draft["body"] for draft in drafts)
+    assert any(draft["subject"] == "Idea for Nina" and "https://nina.example" in draft["body"] for draft in drafts)
+
+
+def test_bulk_generation_template_plus_ai_passes_template_instruction(client, monkeypatch):
+    monkeypatch.setenv("FINIMATIC_FAKE_AI", "1")
+    configure_sender(client, canary_verified=True)
+    contact = client.post(
+        "/api/contacts",
+        json={"email": "template-ai@example.com", "creator_name": "Casey Lead", "website_url": "https://casey.example", "source": "manual"},
+    ).json()
+    template = client.post(
+        "/api/templates",
+        json={
+            "name": "Template Plus AI",
+            "subject_template": "Meeting idea for {{first_name}}",
+            "body_template": "Hi {{first_name}}, I noticed {{website}} and wanted to ask for a short meeting.",
+        },
+    ).json()
+
+    job = client.post(
+        "/api/drafts/generate-bulk",
+        json={
+            "contact_ids": [contact["id"]],
+            "provider": "groq",
+            "tone": "Direct",
+            "mode": "template_plus_ai",
+            "template_id": template["id"],
+            "instruction": "Ask if we can meet and discuss next steps.",
+        },
+    ).json()
+    status = _wait_for_bulk_job(client, job["job_id"])
+    drafts = client.get("/api/drafts").json()["items"]
+
+    assert status["status"] == "completed"
+    assert status["generated"] == 1
+    assert drafts[0]["ai_provider"] == "groq"
+    assert "Ask if we can meet" in drafts[0]["body"]
+
+
 def test_template_create_from_approved_draft(client):
     configure_sender(client, canary_verified=True, dry_run=False)
     contact, draft = _make_contact_and_draft(client, email="template@example.com")
@@ -940,6 +1021,8 @@ def test_dry_run_skips_then_same_queue_sends_when_live(client):
     assert checked["status"] == "skipped"
     assert checked["policy_block_reasons"] == ["DRY_RUN_ENABLED"]
     assert checked["last_attempt_error_code"] == "DRY_RUN_ENABLED"
+    listed = client.get("/api/queue").json()["items"]
+    assert listed[0]["last_attempt_error_code"] == "DRY_RUN_ENABLED"
     assert len(client.app.state.transport.sent) == 0
 
     client.post("/api/settings", json={"dry_run": False})
