@@ -110,7 +110,7 @@ export function saveConversations(conversations: AssistantConversation[], curren
       content: message.content,
       ts: message.ts,
       attachments: message.attachments ?? [],
-      pendingAction: null
+      pendingAction: message.pendingAction ?? null
     }))
   }));
   localStorage.setItem(STORAGE.conversations, JSON.stringify(clean));

@@ -1,8 +1,96 @@
 from app.core.crypto import fingerprint
 from app.db.models import Setting
 from app.db.session import SessionLocal
+from app.settings.service import set_value
 
 from conftest import configure_sender
+
+
+def test_settings_reports_effective_auto_processing_runtime_state(client, monkeypatch):
+    disabled = client.get("/api/settings").json()
+
+    assert disabled["auto_process_enabled"] is False
+    assert disabled["auto_process_effective"] is False
+    assert disabled["scheduler_enabled"] is False
+    assert disabled["auto_process_block_reason"] == "runtime_scheduler_disabled"
+
+    monkeypatch.delenv("FINIMATIC_DISABLE_SCHEDULER", raising=False)
+    manual = client.get("/api/settings").json()
+
+    assert manual["auto_process_enabled"] is False
+    assert manual["auto_process_effective"] is False
+    assert manual["scheduler_enabled"] is True
+    assert manual["auto_process_block_reason"] == "setting_disabled"
+
+    enabled = client.post("/api/settings", json={"auto_process_enabled": True}).json()
+
+    assert enabled["auto_process_enabled"] is True
+    assert enabled["auto_process_effective"] is True
+    assert enabled["scheduler_enabled"] is True
+    assert enabled["auto_process_block_reason"] is None
+
+
+def test_render_free_defaults_to_gmail_api_and_rejects_smtp(client, monkeypatch):
+    monkeypatch.setenv("FINIMATIC_HOSTING_MODE", "render_free")
+    with SessionLocal() as db:
+        db.query(Setting).filter(Setting.key.in_(["email_transport", "auto_process_enabled"])).delete(
+            synchronize_session=False
+        )
+        db.commit()
+
+    settings = client.get("/api/settings").json()
+
+    assert settings["email_transport"] == "gmail_api"
+    assert settings["auto_process_enabled"] is False
+    assert settings["hosting_mode"] == "render_free"
+    assert settings["automation_reliability"] == "best_effort_free_tier"
+    assert settings["smtp_available"] is False
+
+    rejected = client.post("/api/settings", json={"email_transport": "smtp"})
+
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"] == "hosted_transport_requires_gmail_api"
+
+
+def test_unchanged_sender_settings_preserve_canary_verification(client):
+    with SessionLocal() as db:
+        set_value(db, "gmail_user", "sender@finimatic.test")
+        set_value(db, "report_recipient", "report@recipient.test")
+        set_value(db, "email_transport", "gmail_api")
+        set_value(db, "canary_verified", "true")
+        set_value(db, "sender_readiness", "canary_verified")
+        db.commit()
+
+    response = client.post(
+        "/api/settings",
+        json={
+            "gmail_user": "sender@finimatic.test",
+            "report_recipient": "report@recipient.test",
+            "email_transport": "gmail_api",
+            "daily_send_cap": 25,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["canary_verified"] is True
+    assert response.json()["sender_readiness"] == "canary_verified"
+
+
+def test_changed_sender_identity_invalidates_canary_verification(client):
+    with SessionLocal() as db:
+        set_value(db, "gmail_user", "sender@finimatic.test")
+        set_value(db, "canary_verified", "true")
+        set_value(db, "sender_readiness", "canary_verified")
+        db.commit()
+
+    response = client.post(
+        "/api/settings",
+        json={"gmail_user": "different-sender@finimatic.test"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["canary_verified"] is False
+    assert response.json()["sender_readiness"] == "not_configured"
 
 
 def test_settings_encrypts_secrets_and_returns_only_fingerprints(client):
@@ -132,7 +220,8 @@ def test_canary_send_success_and_duplicate_block(client):
     client.post("/api/settings/verify-smtp")
 
     first = client.post("/api/canary/send").json()
-    assert first["status"] == "success"
+    assert first["status"] == "provider_accepted"
+    assert first["provider_accepted"] is True
     assert first["nonce"]
     assert first["sender_identity"] == "sender@example.com"
     assert client.get("/api/settings").json()["canary_verified"] is True

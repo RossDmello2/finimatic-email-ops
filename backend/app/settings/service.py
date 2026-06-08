@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -25,7 +26,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "daily_send_cap": "50",
     "hourly_send_cap": "10",
     "send_delay_s": "60",
-    "auto_process_enabled": "true",
+    "auto_process_enabled": "false",
     "auto_process_queue_interval_seconds": "5",
     "auto_process_followup_interval_seconds": "60",
     "followup_interval_days": "3",
@@ -55,6 +56,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "imap_fetch_interval_minutes": "5",
     "auto_reply_enabled": "false",
     "auto_reply_mode": "propose",
+    "auto_reply_autonomous_authorized": "false",
+    "auto_reply_kill_switch": "true",
+    "auto_reply_kill_generation": "0",
     "auto_reply_daily_cap": "20",
     "auto_reply_min_gap_minutes": "60",
     "auto_reply_safe_intents": "positive_interest,objection,question",
@@ -65,6 +69,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
 }
 
 SECRET_KEYS = {"gmail_app_password", "gmail_api_client_id", "gmail_api_client_secret", "gmail_api_refresh_token", "groq_keys", "gemini_keys"}
+SERVER_MANAGED_KEYS = {
+    "canary_verified",
+    "sender_readiness",
+    "auto_reply_autonomous_authorized",
+    "auto_reply_kill_switch",
+}
 
 
 def seed_settings(db: Session) -> None:
@@ -75,6 +85,8 @@ def seed_settings(db: Session) -> None:
     changed = False
     for key, value in DEFAULT_SETTINGS.items():
         if key not in existing_keys:
+            if key == "email_transport" and os.getenv("FINIMATIC_HOSTING_MODE", "").strip().lower() == "render_free":
+                value = "gmail_api"
             db.add(Setting(key=key, value=value))
             changed = True
     if changed:
@@ -212,18 +224,21 @@ def set_settings(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
 
     for secret_key in ("gmail_app_password", "gmail_api_client_id", "gmail_api_client_secret", "gmail_api_refresh_token"):
         if secret_key in payload and payload[secret_key] is not None:
-            set_value(db, secret_key, encrypt_secret(str(payload[secret_key])))
-            changed_keys.append(secret_key)
+            new_secret = str(payload[secret_key])
+            if get_secret(db, secret_key) != new_secret:
+                set_value(db, secret_key, encrypt_secret(new_secret))
+                changed_keys.append(secret_key)
 
     for key_name in ("groq_keys", "gemini_keys"):
         if key_name in payload and payload[key_name] is not None:
             keys = parse_keys(payload[key_name])
-            encrypted = [encrypt_secret(key) for key in keys]
-            set_value(db, key_name, json.dumps(encrypted))
-            changed_keys.append(key_name)
+            if get_key_list(db, key_name) != keys:
+                encrypted = [encrypt_secret(key) for key in keys]
+                set_value(db, key_name, json.dumps(encrypted))
+                changed_keys.append(key_name)
 
     for key, value in payload.items():
-        if key in SECRET_KEYS or value is None:
+        if key in SECRET_KEYS or key in SERVER_MANAGED_KEYS or value is None:
             continue
         if key in DEFAULT_SETTINGS:
             if isinstance(value, bool):
@@ -238,14 +253,28 @@ def set_settings(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
                 stored = DEFAULT_SETTINGS["email_transport"]
             if key == "auto_reply_mode" and stored not in {"propose", "autonomous"}:
                 stored = DEFAULT_SETTINGS["auto_reply_mode"]
-            set_value(db, key, stored)
-            changed_keys.append(key)
+            if get_value(db, key, DEFAULT_SETTINGS.get(key, "")) != stored:
+                set_value(db, key, stored)
+                changed_keys.append(key)
 
     if get_bool(db, "warm_up_mode") and not warm_up_was_enabled:
         set_value(db, "warm_up_start_date", datetime.now(timezone.utc).date().isoformat())
         changed_keys.append("warm_up_start_date")
     elif not get_bool(db, "warm_up_mode"):
         set_value(db, "warm_up_start_date", "")
+
+    sender_identity_keys = {
+        "email_transport",
+        "gmail_user",
+        "gmail_app_password",
+        "gmail_api_client_id",
+        "gmail_api_client_secret",
+        "gmail_api_refresh_token",
+        "report_recipient",
+    }
+    if sender_identity_keys.intersection(changed_keys):
+        set_value(db, "canary_verified", "false")
+        set_value(db, "sender_readiness", "configured" if sender_credentials_configured(db) else "not_configured")
 
     if get_bool(db, "canary_verified"):
         set_value(db, "sender_readiness", "canary_verified")
@@ -254,19 +283,74 @@ def set_settings(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
         if current == "not_configured":
             set_value(db, "sender_readiness", "configured")
 
-    emit_event(db, "settings.updated", payload={"changed_keys": sorted(set(changed_keys))})
+    scheduling_keys = {
+        "send_window_start",
+        "send_window_end",
+        "send_timezone",
+        "send_delay_s",
+        "email_transport",
+        "gmail_user",
+        "gmail_app_password",
+        "gmail_api_client_id",
+        "gmail_api_client_secret",
+        "gmail_api_refresh_token",
+    }
+    rescheduled_queue_entries = 0
+    if scheduling_keys.intersection(changed_keys):
+        from app.send.queue_worker import reschedule_policy_deferred_queue_entries
+
+        rescheduled_queue_entries = reschedule_policy_deferred_queue_entries(
+            db,
+            changed_keys=set(changed_keys),
+        )
+
+    emit_event(
+        db,
+        "settings.updated",
+        payload={
+            "changed_keys": sorted(set(changed_keys)),
+            "rescheduled_queue_entries": rescheduled_queue_entries,
+        },
+    )
     db.commit()
     return settings_read(db)
 
 
 def settings_read(db: Session) -> dict[str, Any]:
     seed_settings(db)
+    from app.send.smtp_adapter import resolve_transport_metadata
+
     snapshot = _settings_snapshot(db)
     groq = _snapshot_key_list(snapshot, "groq_keys")
     gemini = _snapshot_key_list(snapshot, "gemini_keys")
+    transport = resolve_transport_metadata(db)
+    auto_process_configured = _snapshot_bool(snapshot, "auto_process_enabled")
+    scheduler_disabled = os.getenv("FINIMATIC_DISABLE_SCHEDULER") == "1"
+    auto_process_runtime_disabled = os.getenv("FINIMATIC_DISABLE_AUTO_PROCESS") == "1"
+    hosting_mode = os.getenv("FINIMATIC_HOSTING_MODE", "local").strip().lower() or "local"
+    automation_reliability = (
+        "best_effort_free_tier"
+        if hosting_mode == "render_free"
+        else "runtime_dependent"
+    )
+    auto_process_effective = auto_process_configured and not scheduler_disabled and not auto_process_runtime_disabled
+    auto_process_block_reason = (
+        "runtime_scheduler_disabled"
+        if scheduler_disabled
+        else "runtime_auto_process_disabled"
+        if auto_process_runtime_disabled
+        else "setting_disabled"
+        if not auto_process_configured
+        else None
+    )
     return {
         "gmail_user": _snapshot_value(snapshot, "gmail_user"),
         "email_transport": _snapshot_value(snapshot, "email_transport", DEFAULT_SETTINGS["email_transport"]),
+        "configured_transport": transport.configured_transport,
+        "effective_transport": transport.effective_transport,
+        "transport_source": transport.transport_source,
+        "transport_simulated": transport.simulated,
+        "transport_mismatch": transport.configured_transport != transport.effective_transport,
         "gmail_app_password_configured": bool(_snapshot_value(snapshot, "gmail_app_password")),
         "gmail_api_configured": all(
             bool(_snapshot_value(snapshot, key))
@@ -280,7 +364,13 @@ def settings_read(db: Session) -> dict[str, Any]:
         "daily_send_cap": _snapshot_int(snapshot, "daily_send_cap"),
         "hourly_send_cap": _snapshot_int(snapshot, "hourly_send_cap"),
         "send_delay_s": _snapshot_int(snapshot, "send_delay_s"),
-        "auto_process_enabled": _snapshot_bool(snapshot, "auto_process_enabled"),
+        "auto_process_enabled": auto_process_configured,
+        "auto_process_effective": auto_process_effective,
+        "auto_process_block_reason": auto_process_block_reason,
+        "scheduler_enabled": not scheduler_disabled,
+        "hosting_mode": hosting_mode,
+        "automation_reliability": automation_reliability,
+        "smtp_available": hosting_mode != "render_free",
         "auto_process_queue_interval_seconds": _snapshot_int(snapshot, "auto_process_queue_interval_seconds"),
         "auto_process_followup_interval_seconds": _snapshot_int(snapshot, "auto_process_followup_interval_seconds"),
         "followup_interval_days": _snapshot_int(snapshot, "followup_interval_days"),
@@ -305,6 +395,8 @@ def settings_read(db: Session) -> dict[str, Any]:
         "imap_fetch_interval_minutes": _snapshot_int(snapshot, "imap_fetch_interval_minutes"),
         "auto_reply_enabled": _snapshot_bool(snapshot, "auto_reply_enabled"),
         "auto_reply_mode": _snapshot_value(snapshot, "auto_reply_mode", DEFAULT_SETTINGS["auto_reply_mode"]),
+        "auto_reply_autonomous_authorized": _snapshot_bool(snapshot, "auto_reply_autonomous_authorized"),
+        "auto_reply_kill_switch": _snapshot_bool(snapshot, "auto_reply_kill_switch"),
         "auto_reply_daily_cap": _snapshot_int(snapshot, "auto_reply_daily_cap"),
         "auto_reply_min_gap_minutes": _snapshot_int(snapshot, "auto_reply_min_gap_minutes"),
         "auto_reply_safe_intents": _snapshot_value(snapshot, "auto_reply_safe_intents", DEFAULT_SETTINGS["auto_reply_safe_intents"]),
@@ -312,6 +404,10 @@ def settings_read(db: Session) -> dict[str, Any]:
         "canary_verified": _snapshot_bool(snapshot, "canary_verified"),
         "sender_readiness": _snapshot_value(snapshot, "sender_readiness", "not_configured"),
         "mode": _mode_label_from_snapshot(snapshot),
+        "api_security_mode": "unauthenticated_local_only",
+        "api_security_enforced": False,
+        "release_blocked": True,
+        "release_block_reason": "production_identity_architecture_not_configured",
     }
 
 

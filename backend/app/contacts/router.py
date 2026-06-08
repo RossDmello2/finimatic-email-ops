@@ -11,10 +11,19 @@ from sqlalchemy.orm import Session
 from app.audit.service import emit_event
 from app.contacts.utils import custom_fields_with_tags
 from app.core.time import iso, utcnow
-from app.db.models import Contact, FollowUpSequence, PendingEmailActionRow, SendQueue
+from app.db.models import Contact
 from app.db.session import get_db
+from app.send.stop_service import stop_contact_send_work
 
 router = APIRouter(prefix="/api/contacts", tags=["contacts"])
+
+STOP_REASON_BY_STATUS = {
+    "replied": "RECIPIENT_REPLIED",
+    "unsubscribed": "RECIPIENT_UNSUBSCRIBED",
+    "bounced": "RECIPIENT_BOUNCED",
+    "suppressed": "RECIPIENT_SUPPRESSED",
+    "manually_paused": "RECIPIENT_MANUALLY_PAUSED",
+}
 
 
 class ContactCreate(BaseModel):
@@ -131,8 +140,12 @@ def patch_contact(contact_id: str, payload: ContactPatch, db: Session = Depends(
     data = payload.model_dump(exclude_unset=True)
     if "auto_reply_override" in data and data["auto_reply_override"] not in {None, "enabled", "disabled", "propose"}:
         raise HTTPException(status_code=422, detail="auto_reply_override must be enabled, disabled, propose, or null")
+    previous_status = contact.status
     for key, value in data.items():
         setattr(contact, key, value)
+    next_status = data.get("status")
+    if next_status != previous_status and next_status in STOP_REASON_BY_STATUS:
+        stop_contact_send_work(db, contact.id, STOP_REASON_BY_STATUS[next_status])
     emit_event(db, "reply.classified" if data.get("status") in {"replied", "bounced"} else "settings.updated", entity_type="contact", entity_id=contact.id, payload=data)
     db.commit()
     return contact_to_dict(contact)
@@ -143,23 +156,15 @@ def delete_contact(contact_id: str, db: Session = Depends(get_db)):
     contact = db.get(Contact, contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="contact not found")
-    if contact.deleted_at is None:
+    newly_deleted = contact.deleted_at is None
+    if newly_deleted:
         contact.deleted_at = utcnow()
-    cancelled_queue = (
-        db.query(SendQueue)
-        .filter(SendQueue.contact_id == contact.id, SendQueue.status.in_(["pending", "skipped"]))
-        .update({"status": "cancelled", "policy_block_reasons": json.dumps(["CONTACT_DELETED"])}, synchronize_session=False)
-    )
-    stopped_followups = (
-        db.query(FollowUpSequence)
-        .filter(FollowUpSequence.contact_id == contact.id, FollowUpSequence.status.in_(["due", "skipped", "pending_approval"]))
-        .update({"status": "stopped", "stop_reason": "CONTACT_DELETED"}, synchronize_session=False)
-    )
-    cancelled_agent_actions = (
-        db.query(PendingEmailActionRow)
-        .filter(PendingEmailActionRow.contact_id == contact.id, PendingEmailActionRow.consumed.is_(False))
-        .update({"consumed": True, "consumed_at": utcnow()}, synchronize_session=False)
-    )
+    affected = stop_contact_send_work(db, contact.id, "CONTACT_DELETED") if newly_deleted else {
+        "queue_ids": [],
+        "followup_ids": [],
+        "pending_email_action_ids": [],
+        "pending_agent_action_ids": [],
+    }
     emit_event(
         db,
         "contact.deleted",
@@ -167,9 +172,10 @@ def delete_contact(contact_id: str, db: Session = Depends(get_db)):
         entity_id=contact.id,
         payload={
             "email": contact.email,
-            "cancelled_queue": cancelled_queue,
-            "stopped_followups": stopped_followups,
-            "cancelled_agent_actions": cancelled_agent_actions,
+            "cancelled_queue": len(affected["queue_ids"]),
+            "stopped_followups": len(affected["followup_ids"]),
+            "cancelled_email_actions": len(affected["pending_email_action_ids"]),
+            "cancelled_agent_actions": len(affected["pending_agent_action_ids"]),
         },
     )
     db.commit()

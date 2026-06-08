@@ -16,6 +16,7 @@ from app.audit.service import emit_event
 from app.core.time import utcnow
 from app.db.models import Contact, ProviderHealth, Reply, SendAttempt
 from app.replies.service import classify_intent, create_reply_record
+from app.send.sequence import provider_acceptance_evidence_present
 from app.settings.service import get_key_list, get_secret, get_value
 
 
@@ -182,12 +183,14 @@ class IMAPReplyFetcher:
     def _latest_sent_by_contact(self) -> dict[str, object]:
         rows = (
             self.db.query(SendAttempt)
-            .filter(SendAttempt.status == "success", SendAttempt.contact_id != "canary", SendAttempt.sent_at.is_not(None))
+            .filter(SendAttempt.provider_accepted.is_(True), SendAttempt.contact_id != "canary", SendAttempt.sent_at.is_not(None))
             .order_by(SendAttempt.sent_at.desc())
             .all()
         )
         latest: dict[str, object] = {}
         for row in rows:
+            if not provider_acceptance_evidence_present(row):
+                continue
             if row.contact_id not in latest:
                 sent_at = row.sent_at
                 if getattr(sent_at, "tzinfo", None) is not None:
@@ -198,15 +201,18 @@ class IMAPReplyFetcher:
     def _sent_attempts_by_message_id(self) -> dict[str, SendAttempt]:
         rows = (
             self.db.query(SendAttempt)
-            .filter(SendAttempt.status == "success", SendAttempt.contact_id != "canary", SendAttempt.provider_msg_id.is_not(None))
+            .filter(SendAttempt.provider_accepted.is_(True), SendAttempt.contact_id != "canary")
             .order_by(SendAttempt.sent_at.desc())
             .all()
         )
         attempts: dict[str, SendAttempt] = {}
         for row in rows:
-            normalized = self._normalize_message_id(row.provider_msg_id)
-            if normalized and normalized not in attempts:
-                attempts[normalized] = row
+            if not provider_acceptance_evidence_present(row):
+                continue
+            for raw_message_id in (row.provider_msg_id, row.tracking_message_id):
+                normalized = self._normalize_message_id(raw_message_id)
+                if normalized and normalized not in attempts:
+                    attempts[normalized] = row
         return attempts
 
     def _contact_from_thread_headers(self, message: Message, attempts_by_message_id: dict[str, SendAttempt]) -> Contact | None:

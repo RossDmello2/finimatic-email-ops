@@ -29,8 +29,31 @@ class GoalFrameAgent:
 
 
 def _capability_from_text(lowered: str) -> str:
-    if any(phrase in lowered for phrase in ("delete", "forward", "change password", "api key", "settings key")):
+    if any(
+        phrase in lowered
+        for phrase in (
+            "delete",
+            "forward",
+            "change password",
+            "api key",
+            "settings key",
+            "run any tool",
+            "write anything",
+            "change settings",
+            "send any email",
+        )
+    ):
         return "unsupported"
+    if "workflow" in lowered and any(phrase in lowered for phrase in ("retry", "failed")):
+        return "workflow_retry_failed"
+    if "workflow" in lowered and any(phrase in lowered for phrase in ("start", "run", "execute")):
+        return "workflow_run_start"
+    if any(word in lowered for word in ("crm", "sheets", "salesforce", "hubspot", "integration")) and any(phrase in lowered for phrase in ("preview", "sync", "diff")):
+        return "crm_preview_sync"
+    if "deliverability" in lowered and any(phrase in lowered for phrase in ("summary", "health", "status", "read")):
+        return "deliverability_read_summary"
+    if "deliverability" in lowered and any(phrase in lowered for phrase in ("queue block", "blocked queue", "why blocked")):
+        return "deliverability_explain_queue_block"
     if "compose" in lowered and "email" in lowered:
         return "email_generate_draft"
     if "draft" in lowered and "follow" in lowered:

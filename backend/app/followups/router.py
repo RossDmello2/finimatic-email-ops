@@ -78,8 +78,14 @@ def process_followups(db: Session = Depends(get_db)):
 
 
 def _delivery_status(result: dict, queue: SendQueue | None) -> str:
+    if result.get("provider_accepted"):
+        return "provider_accepted"
     if result.get("sent"):
         return "sent"
+    if result.get("simulated"):
+        return "simulated"
+    if result.get("reconciliation_required"):
+        return "reconciliation_required"
     if result.get("deferred"):
         return "deferred"
     if result.get("blocked"):
@@ -88,6 +94,8 @@ def _delivery_status(result: dict, queue: SendQueue | None) -> str:
         return "dry_run_blocked"
     if queue is None:
         return "queued"
+    if queue.status == "provider_accepted":
+        return "provider_accepted"
     if queue.status == "sent":
         return "sent"
     if queue.status == "pending":
@@ -96,6 +104,10 @@ def _delivery_status(result: dict, queue: SendQueue | None) -> str:
         return "blocked"
     if queue.status == "skipped":
         return "dry_run_blocked"
+    if queue.status == "simulated":
+        return "simulated"
+    if queue.status == "reconciliation_required":
+        return "reconciliation_required"
     if queue.status == "failed":
         return "failed"
     return queue.status or "queued"

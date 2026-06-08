@@ -15,6 +15,8 @@ import {
   KeyRound,
   Library,
   ListChecks,
+  LogIn,
+  LogOut,
   Mail,
   Megaphone,
   MessageSquare,
@@ -27,41 +29,65 @@ import {
   ShieldCheck,
   Sparkles,
   Trash2,
-  Users
+  Users,
+  X
 } from "lucide-react";
 import { toast } from "sonner";
 import {
   api,
   AuditEvent,
   AutoReplyPending,
+  BulkJob,
   CampaignPlan,
   CampaignStep,
   Contact,
+  ContactEvidence,
   ConversationDraft,
   ConversationSummary,
+  DeliverabilitySummary,
   Draft,
+  AccountFact,
+  EmailVerification,
+  EnrichmentWorkbook,
+  EvidenceCheck,
+  ExternalWritePreview,
   Followup,
   FollowupApprovalResponse,
+  GovernedAction,
   ImportCommit,
   ImportPreview,
+  IntegrationsSummary,
+  LeadFact,
   QueueEntry,
+  QueueProcessResult,
   ReplyRow,
+  SecurityStatus,
   SettingsRead,
   Suppression,
   TemplateRow,
   ProviderHealth,
-  ApprovalResponse
+  ApprovalResponse,
+  BulkApprovalResponse,
+  AuthSession,
+  VerificationSummary,
+  WorkflowDetail,
+  WorkflowSummary,
+  authenticationLoginUrl
 } from "./api/client";
 import { AssistantWidget } from "./features/floating-assistant/AssistantWidget";
+import { getSessionToken } from "./features/floating-assistant/assistantApi";
 
 const surfaces = [
   ["setup", "Setup", ShieldCheck],
   ["health", "Provider Health", HeartPulse],
+  ["deliverability", "Deliverability", ShieldCheck],
   ["import", "Import", FileUp],
   ["contacts", "Contacts", Users],
+  ["enrichment", "Enrichment", Search],
   ["drafts", "Drafts", Sparkles],
   ["templates", "Templates", Library],
   ["campaigns", "Campaigns", Megaphone],
+  ["workflows", "Workflows", Activity],
   ["queue", "Queue", ListChecks],
   ["followups", "Follow-ups", RefreshCw],
   ["replies", "Replies/Stops", Inbox],
@@ -70,32 +96,49 @@ const surfaces = [
   ["suppressions", "Suppressions", ArchiveX],
   ["audit", "Audit Logs", Database],
   ["errors", "Errors", AlertTriangle],
+  ["integrations", "Integrations", KeyRound],
   ["settings", "Settings", Settings]
 ] as const;
 
 type Surface = (typeof surfaces)[number][0];
 type BulkDraftMode = "ai_only" | "template_only" | "template_plus_ai";
 
-function useAppData(surface: Surface) {
+function useAppData(surface: Surface, operationalEnabled: boolean) {
   const repliesVisible = surface === "replies";
   const conversationsVisible = surface === "conversations";
   const autoReplyVisible = surface === "autoReply";
+  const deliverabilityVisible = surface === "deliverability";
+  const enrichmentVisible = surface === "enrichment";
+  const verificationVisible = ["contacts", "enrichment", "drafts", "queue", "deliverability"].includes(surface);
+  const workflowsVisible = surface === "workflows";
+  const integrationsVisible = surface === "integrations";
+  const providerHealth = useQuery({
+    queryKey: ["provider-health"],
+    queryFn: api.listProviderHealth,
+    enabled: operationalEnabled,
+    refetchInterval: operationalEnabled ? 30000 : false
+  });
   return {
-    settings: useQuery({ queryKey: ["settings"], queryFn: api.getSettings }),
-    providerHealth: useQuery({ queryKey: ["provider-health"], queryFn: api.listProviderHealth, refetchInterval: 30000 }),
-    contacts: useQuery({ queryKey: ["contacts"], queryFn: api.listContacts }),
-    recentlyDeletedContacts: useQuery({ queryKey: ["contacts", "recently-deleted"], queryFn: api.listRecentlyDeletedContacts }),
-    drafts: useQuery({ queryKey: ["drafts"], queryFn: api.listDrafts }),
-    queue: useQuery({ queryKey: ["queue"], queryFn: api.listQueue }),
-    followups: useQuery({ queryKey: ["followups"], queryFn: api.listFollowups }),
-    suppressions: useQuery({ queryKey: ["suppressions"], queryFn: api.listSuppressions }),
-    replies: useQuery({ queryKey: ["replies"], queryFn: () => api.listReplies({ include_archived: true }), enabled: repliesVisible, refetchInterval: repliesVisible ? 5000 : false }),
-    conversations: useQuery({ queryKey: ["conversations"], queryFn: api.listConversations, enabled: conversationsVisible, refetchInterval: conversationsVisible ? 5000 : false }),
-    templates: useQuery({ queryKey: ["templates"], queryFn: api.listTemplates }),
-    campaigns: useQuery({ queryKey: ["campaigns"], queryFn: api.listCampaigns }),
-    autoReplyPending: useQuery({ queryKey: ["auto-reply-pending"], queryFn: api.listAutoReplyPending, enabled: autoReplyVisible, refetchInterval: autoReplyVisible ? 5000 : false }),
-    autoReplyLog: useQuery({ queryKey: ["auto-reply-log"], queryFn: api.listAutoReplyLog, enabled: autoReplyVisible, refetchInterval: autoReplyVisible ? 5000 : false }),
-    audit: useQuery({ queryKey: ["audit"], queryFn: api.listAudit })
+    settings: useQuery({ queryKey: ["settings"], queryFn: api.getSettings, enabled: operationalEnabled, retry: false }),
+    providerHealth,
+    deliverability: useQuery({ queryKey: ["deliverability"], queryFn: api.getDeliverabilitySummary, enabled: operationalEnabled && deliverabilityVisible }),
+    contacts: useQuery({ queryKey: ["contacts"], queryFn: api.listContacts, enabled: operationalEnabled }),
+    recentlyDeletedContacts: useQuery({ queryKey: ["contacts", "recently-deleted"], queryFn: api.listRecentlyDeletedContacts, enabled: operationalEnabled }),
+    enrichmentWorkbook: useQuery({ queryKey: ["enrichment-workbook"], queryFn: api.getEnrichmentWorkbook, enabled: operationalEnabled && enrichmentVisible }),
+    verifications: useQuery({ queryKey: ["verifications"], queryFn: api.listVerifications, enabled: operationalEnabled && verificationVisible }),
+    drafts: useQuery({ queryKey: ["drafts"], queryFn: api.listDrafts, enabled: operationalEnabled }),
+    queue: useQuery({ queryKey: ["queue"], queryFn: api.listQueue, enabled: operationalEnabled }),
+    followups: useQuery({ queryKey: ["followups"], queryFn: api.listFollowups, enabled: operationalEnabled }),
+    suppressions: useQuery({ queryKey: ["suppressions"], queryFn: api.listSuppressions, enabled: operationalEnabled }),
+    replies: useQuery({ queryKey: ["replies"], queryFn: () => api.listReplies({ include_archived: true }), enabled: operationalEnabled && repliesVisible, refetchInterval: operationalEnabled && repliesVisible ? 5000 : false }),
+    conversations: useQuery({ queryKey: ["conversations"], queryFn: api.listConversations, enabled: operationalEnabled && conversationsVisible, refetchInterval: operationalEnabled && conversationsVisible ? 5000 : false }),
+    templates: useQuery({ queryKey: ["templates"], queryFn: api.listTemplates, enabled: operationalEnabled }),
+    campaigns: useQuery({ queryKey: ["campaigns"], queryFn: api.listCampaigns, enabled: operationalEnabled }),
+    workflows: useQuery({ queryKey: ["workflows"], queryFn: api.listWorkflows, enabled: operationalEnabled && workflowsVisible }),
+    integrations: useQuery({ queryKey: ["integrations"], queryFn: api.listIntegrations, enabled: operationalEnabled && integrationsVisible }),
+    autoReplyPending: useQuery({ queryKey: ["auto-reply-pending"], queryFn: api.listAutoReplyPending, enabled: operationalEnabled && autoReplyVisible, refetchInterval: operationalEnabled && autoReplyVisible ? 5000 : false }),
+    autoReplyLog: useQuery({ queryKey: ["auto-reply-log"], queryFn: api.listAutoReplyLog, enabled: operationalEnabled && autoReplyVisible, refetchInterval: operationalEnabled && autoReplyVisible ? 5000 : false }),
+    audit: useQuery({ queryKey: ["audit"], queryFn: api.listAudit, enabled: operationalEnabled })
   };
 }
 
@@ -139,18 +182,26 @@ async function refreshReplyViews(queryClient: ReturnType<typeof useQueryClient>,
 
 function ModeLabel({ settings }: { settings?: SettingsRead }) {
   const mode = settings?.mode ?? "DRY-RUN";
+  const liveBlocked = mode === "LIVE" && Boolean(
+    settings?.transport_simulated || settings?.transport_mismatch || settings?.release_blocked
+  );
   const className =
-    mode === "LIVE"
+    mode === "LIVE" && !liveBlocked
       ? "border-emerald-700 bg-emerald-700 text-white"
       : mode === "CANARY"
         ? "border-amber-500 bg-amber-100 text-amber-900"
         : "border-slate-400 bg-slate-100 text-slate-800";
-  return <span className={`inline-flex h-8 items-center rounded border px-3 text-xs font-semibold ${className}`}>{mode}</span>;
+  const label = liveBlocked ? "LIVE BLOCKED" : mode;
+  return <span className={`inline-flex h-8 items-center rounded border px-3 text-xs font-semibold ${className}`}>{label}</span>;
 }
 
-function ListeningIndicator({ enabled }: { enabled?: boolean }) {
-  if (!enabled) return null;
-  return <span className="listening-indicator"><span /> LISTENING</span>;
+function ListeningIndicator({ settings }: { settings?: SettingsRead }) {
+  const label = !settings?.auto_reply_enabled
+    ? "AUTO-REPLY OFF"
+    : settings.auto_reply_mode === "autonomous" && settings.auto_reply_autonomous_authorized && !settings.auto_reply_kill_switch
+      ? "AUTONOMOUS"
+      : "PROPOSAL ONLY";
+  return <span className="listening-indicator"><span /> {label}</span>;
 }
 
 function Panel({ title, icon: Icon, children, action }: { title: string; icon: typeof Activity; children: React.ReactNode; action?: React.ReactNode }) {
@@ -169,8 +220,180 @@ function Panel({ title, icon: Icon, children, action }: { title: string; icon: t
 }
 
 function StatusPill({ value }: { value: string }) {
-  const tone = value.includes("failed") || value.includes("blocked") ? "bad" : value.includes("verified") || value === "sent" || value === "success" ? "good" : "neutral";
+  const normalized = value.toLowerCase();
+  const badStatuses = new Set(["failed", "blocked", "reconciliation_required", "missing", "rejected", "inactive", "not_allowed", "unsafe", "invalid", "hard_bounce", "suppressed"]);
+  const goodStatuses = new Set(["verified", "valid", "sent", "provider_accepted", "passed", "fresh", "source_backed", "active", "smtp_verified", "provider_verified", "canary_verified"]);
+  const bad = badStatuses.has(normalized);
+  const good = goodStatuses.has(normalized);
+  const tone = bad ? "bad" : good ? "good" : "neutral";
   return <span className={`pill ${tone}`}>{value}</span>;
+}
+
+function TransportTruth({ settings, compact = false }: { settings?: SettingsRead; compact?: boolean }) {
+  if (!settings) return null;
+  const identityKind = settings.gmail_user?.toLowerCase().endsWith(".test")
+    ? "synthetic"
+    : settings.gmail_user
+      ? "configured"
+      : "not_configured";
+  return (
+    <div className={compact ? "notice" : "notice mt-4"}>
+      <strong>Transport truth</strong>
+      <div>identity={identityKind}</div>
+      <div>configured={settings.configured_transport} effective={settings.effective_transport}</div>
+      <div>source={settings.transport_source} simulated={settings.transport_simulated ? "yes" : "no"}</div>
+      {settings.transport_mismatch && <div className="text-danger">Configured and effective transport differ.</div>}
+    </div>
+  );
+}
+
+function RuntimeBanner({
+  security,
+  settings,
+  session,
+  authState
+}: {
+  security?: SecurityStatus;
+  settings?: SettingsRead;
+  session?: AuthSession;
+  authState: "checking" | "unauthenticated" | "validating" | "authenticated" | "rejected";
+}) {
+  const identityKind = settings?.gmail_user?.toLowerCase().endsWith(".test")
+    ? "synthetic"
+    : settings?.gmail_user
+      ? "configured"
+      : "unavailable";
+  const authEnforced = security?.authentication_enforced === true;
+  return (
+    <section className={`runtime-banner ${authEnforced && (security?.release_blocked || authState !== "authenticated") ? "blocked" : ""}`} aria-label="Runtime identity, authentication, and transport">
+      <div><span>Identity</span><strong>{identityKind}{settings?.gmail_user ? `: ${settings.gmail_user}` : ""}</strong></div>
+      {authEnforced
+        ? <div><span>Operator</span><strong>{session?.authenticated ? `${session.subject} (${session.roles.join(", ")})` : authState}</strong></div>
+        : <div><span>Access</span><strong>direct use</strong></div>}
+      <div><span>Transport</span><strong>{settings ? `${settings.configured_transport} -> ${settings.effective_transport}` : "loading backend settings"}</strong></div>
+      <div><span>Source</span><strong>{settings?.transport_source ?? "backend settings unavailable"}</strong></div>
+      <div><span>Provider execution</span><strong>{settings ? (settings.transport_simulated ? "simulated; provider not contacted" : "live-capable; policy still applies") : "unknown"}</strong></div>
+    </section>
+  );
+}
+
+function AuthenticationGate({
+  security,
+  authenticated,
+  rejected,
+  checking,
+  onSignIn,
+  onRetry
+}: {
+  security?: SecurityStatus;
+  authenticated: boolean;
+  rejected: boolean;
+  checking: boolean;
+  onSignIn: () => void;
+  onRetry: () => void;
+}) {
+  const backendBlocked = security?.release_blocked === true;
+  const heading = backendBlocked
+    ? "Backend authentication is not configured"
+    : rejected
+      ? "Authenticated session was rejected"
+      : checking
+        ? "Validating authenticated session"
+        : "Authentication required";
+  return (
+    <section className="auth-gate" role="status">
+      <ShieldCheck className="h-8 w-8 text-accent" />
+      <div>
+        <h2>{heading}</h2>
+        <p>
+          {backendBlocked
+            ? "Operational APIs are fail-closed. Configure the approved interactive OIDC session architecture before release."
+            : authenticated
+              ? "Operational data remains gated until the backend accepts the authorized session."
+              : "Sign in through the configured identity provider to create a secure operator session."}
+        </p>
+        <small>Finimatic keeps the browser session in an HttpOnly cookie. Access tokens are not exposed to JavaScript storage.</small>
+      </div>
+      <div className="auth-actions">
+        {!backendBlocked && !authenticated && (
+          <button className="button primary" disabled={checking} onClick={onSignIn}>
+            <LogIn className="h-4 w-4" /> Sign In
+          </button>
+        )}
+        <button className="button secondary" disabled={checking} onClick={onRetry}>
+          <RefreshCw className={checking ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Retry Session
+        </button>
+      </div>
+    </section>
+  );
+}
+
+type VerificationPolicy = { status: string; severity: string; reason_code?: string | null; allowed: boolean };
+
+function verificationMaps(verifications: EmailVerification[]) {
+  return {
+    byContactId: new Map(verifications.filter((row) => row.contact_id).map((row) => [row.contact_id as string, row])),
+    byEmail: new Map(verifications.map((row) => [row.email.toLowerCase(), row]))
+  };
+}
+
+function verificationForContact(contact: Contact | undefined, verifications: EmailVerification[]) {
+  if (!contact) return undefined;
+  const maps = verificationMaps(verifications);
+  return maps.byContactId.get(contact.id) ?? maps.byEmail.get(contact.email.toLowerCase());
+}
+
+function verificationSeverity(status: string, policy?: VerificationPolicy) {
+  if (policy?.severity) return policy.severity;
+  if (["verified", "valid"].includes(status)) return "allow";
+  if (["invalid", "disposable", "stale", "hard_bounce", "suppressed"].includes(status)) return "block";
+  return "warn";
+}
+
+function VerificationBadge({ verification, policy }: { verification?: EmailVerification; policy?: VerificationPolicy }) {
+  const status = policy?.status || verification?.status || "unknown";
+  const severity = verificationSeverity(status, policy);
+  const title = `Recipient verification only. This does not prove inbox placement. ${policy?.reason_code ?? verification?.provider_status ?? ""}`.trim();
+  return <span className={`verification-badge ${severity}`} title={title}>{status}</span>;
+}
+
+function VerificationDetailPanel({
+  detail,
+  isLoading
+}: {
+  detail?: { verification: EmailVerification; attempts: { provider: string; status: string; response_code?: string | null; latency_ms: number; cost_units: number; created_at?: string | null }[]; policy: VerificationPolicy };
+  isLoading?: boolean;
+}) {
+  if (isLoading) return <div className="notice compact">Loading recipient verification...</div>;
+  if (!detail) return <div className="notice compact">No recipient verification check has run yet.</div>;
+  return (
+    <div className="verification-detail">
+      <div className="verification-detail-head">
+        <div>
+          <h3>Recipient Verification</h3>
+          <p>Address validity signals only, not inbox placement.</p>
+        </div>
+        <VerificationBadge verification={detail.verification} policy={detail.policy} />
+      </div>
+      <div className="status-list">
+        <span>Provider <strong>{detail.verification.provider}</strong></span>
+        <span>Result <strong>{detail.verification.provider_status || "not checked"}</strong></span>
+        <span>Confidence <strong>{Math.round((detail.verification.confidence || 0) * 100)}%</strong></span>
+        <span>Fresh until <strong>{detail.verification.expires_at ? new Date(detail.verification.expires_at).toLocaleDateString() : "unknown"}</strong></span>
+        <span>Queue gate <strong>{detail.policy.allowed ? detail.policy.severity : detail.policy.reason_code || "blocked"}</strong></span>
+      </div>
+      <DataTable
+        columns={["provider", "status", "response", "latency", "created"]}
+        rows={detail.attempts.map((row) => [
+          row.provider,
+          row.status,
+          row.response_code ?? "",
+          `${row.latency_ms} ms`,
+          row.created_at ? new Date(row.created_at).toLocaleString() : ""
+        ])}
+      />
+    </div>
+  );
 }
 
 function IntentBadge({ intent }: { intent: string }) {
@@ -183,7 +406,7 @@ function apiErrorMessage(error: unknown, fallback: string) {
   try {
     const parsed = JSON.parse(error.message);
     if (Array.isArray(parsed.detail?.blocked)) {
-      return `${fallback}: ${parsed.detail.blocked.join(", ")}`;
+      return `${fallback}: ${parsed.detail.blocked.map(formatBlockReason).join(", ")}`;
     }
     if (typeof parsed.detail === "string") {
       return `${fallback}: ${parsed.detail}`;
@@ -206,17 +429,26 @@ function apiErrorMessage(error: unknown, fallback: string) {
 }
 
 function deliveryToastMessage(result: ApprovalResponse | FollowupApprovalResponse, fallback: string) {
-  const reasons = result.queue?.policy_block_reasons?.filter(Boolean).join(", ");
-  const lastError = [result.queue?.last_attempt_error_code, result.queue?.last_attempt_error_detail].filter(Boolean).join(": ");
+  const reasons = result.queue?.policy_block_reasons?.filter(Boolean).map(formatBlockReason).join(", ");
+  const lastError = [
+    result.queue?.latest_attempt?.error_code,
+    result.queue?.latest_attempt?.error_detail_redacted,
+    result.queue?.last_attempt_error_code,
+    result.queue?.last_attempt_error_detail
+  ].filter(Boolean).join(": ");
   switch (result.delivery_status) {
+    case "provider_accepted":
     case "sent":
-      return "Email sent.";
+      return "Email provider accepted the message.";
     case "deferred":
       return reasons ? `Approved. Deferred: ${reasons}.` : "Approved. Deferred until the send window or delay clears.";
     case "blocked":
       return reasons ? `Approved, but blocked: ${reasons}.` : "Approved, but blocked by delivery policy.";
+    case "simulated":
     case "dry_run_blocked":
-      return "Dry Run is on. Live mode is required before real delivery.";
+      return "Dry Run is on. No provider was contacted.";
+    case "reconciliation_required":
+      return lastError ? `Provider outcome is uncertain and requires reconciliation: ${lastError}.` : "Provider outcome is uncertain and requires reconciliation.";
     case "failed":
       return lastError ? `Approved, but delivery failed: ${lastError}.` : "Approved, but delivery failed.";
     case "queued_for_bulk":
@@ -227,18 +459,185 @@ function deliveryToastMessage(result: ApprovalResponse | FollowupApprovalRespons
   }
 }
 
+function queueProcessToast(result: QueueProcessResult) {
+  if (!result.processed && result.future_scheduled_count) {
+    const due = result.next_due_at ? ` Next due: ${new Date(result.next_due_at).toLocaleString()}.` : "";
+    const scheduler = result.scheduler_effective === false ? " Scheduler is not running." : "";
+    return `No queue rows were due. ${result.future_scheduled_count} future row(s) remain.${due}${scheduler}`;
+  }
+  if (!result.processed) {
+    return "No eligible queue rows were due; nothing was dispatched.";
+  }
+  return `Queue processed: ${result.processed} processed, ${result.provider_accepted} provider accepted, ${result.simulated} simulated, ${result.blocked} blocked, ${result.reconciliation_required} reconciliation, ${result.deferred ?? 0} deferred`;
+}
+
+function bulkApprovalToast(result: BulkApprovalResponse) {
+  if (result.dispatch_requested) {
+    return `Bulk send: ${result.processed} processed, ${result.provider_accepted} provider accepted, ${result.deferred ?? 0} deferred, ${result.blocked} blocked.`;
+  }
+  const scheduler = result.scheduler_effective ? "Automatic processing may run later." : "Automatic processing is not running.";
+  return `${result.queued} of ${result.selected} selected drafts approved and queued only. ${scheduler}`;
+}
+
 function queueReason(row: QueueEntry) {
   const reasons = row.policy_block_reasons?.filter(Boolean);
-  if (reasons?.length) return reasons.join(", ");
-  const attempt = [row.last_attempt_status, row.last_attempt_error_code, row.last_attempt_error_detail].filter(Boolean);
+  if (reasons?.length) return reasons.map(formatBlockReason).join(", ");
+  const attempt = [
+    row.latest_attempt?.attempt_status,
+    row.latest_attempt?.error_code,
+    row.latest_attempt?.error_detail_redacted,
+    row.last_attempt_status,
+    row.last_attempt_error_code,
+    row.last_attempt_error_detail
+  ].filter(Boolean);
   return attempt.length ? attempt.join(": ") : "none";
+}
+
+function hasQueueAcceptanceEvidence(attempt?: QueueEntry["latest_attempt"]) {
+  if (
+    !attempt
+    || attempt.provider_accepted !== true
+    || attempt.provider_contacted !== true
+    || attempt.simulated !== false
+  ) {
+    return false;
+  }
+  if (attempt.effective_transport === "gmail_api") {
+    const providerMessageId = attempt.provider_message_id?.trim() ?? "";
+    return /^[0-9a-fA-F]{12,32}$/.test(providerMessageId);
+  }
+  return attempt.effective_transport === "smtp"
+    && attempt.provider_response_classification === "smtp_transaction_completed";
+}
+
+const blockReasonLabels: Record<string, string> = {
+  BOUNCE_RATE_HIGH: "Bounce rate is above the sender safety threshold",
+  COMPLAINT_RATE_HIGH: "Complaint rate is above the sender safety threshold",
+  DAILY_CAP_EXCEEDED: "Daily sender cap has been reached",
+  DRAFT_NOT_APPROVED: "Draft is not approved",
+  HOURLY_CAP_EXCEEDED: "Hourly sender cap has been reached",
+  MAILBOX_RAMP_CAP_EXCEEDED: "Mailbox ramp cap has been reached",
+  RECENT_DEFERRAL_SPIKE: "Recent provider deferrals are elevated",
+  RECIPIENT_BOUNCED: "Recipient has a prior bounce or complaint",
+  RECIPIENT_DOMAIN_CAP_BLOCKED: "Recipient domain is blocked by sender cap policy",
+  RECIPIENT_DOMAIN_DAILY_CAP_EXCEEDED: "Recipient domain daily cap has been reached",
+  RECIPIENT_EMAIL_DISPOSABLE: "Recipient email is disposable",
+  RECIPIENT_EMAIL_HARD_BOUNCE: "Recipient email has a prior hard bounce",
+  RECIPIENT_EMAIL_INVALID: "Recipient email is invalid",
+  RECIPIENT_EMAIL_STALE: "Recipient verification is stale",
+  RECIPIENT_EMAIL_SUPPRESSED: "Recipient email is suppressed",
+  RECIPIENT_EMAIL_UNSAFE: "Recipient verification is not safe to queue",
+  RECIPIENT_EMAIL_UNKNOWN: "Recipient verification is unknown",
+  RECIPIENT_REPLIED: "Recipient already replied",
+  RECIPIENT_SUPPRESSED: "Recipient is suppressed",
+  CANARY_NOT_VERIFIED: "Waiting for the one-time Gmail test email",
+  SEND_WINDOW_NOT_ELAPSED: "Send window or spacing has not elapsed",
+  SENDER_DOMAIN_UNHEALTHY: "Sender domain health is blocking this send",
+  SENDER_MAILBOX_UNHEALTHY: "Sender mailbox health is blocking this send",
+  SENDER_NOT_VERIFIED: "Sender is not verified",
+  UNSUPPORTED_PERSONALIZATION: "Draft personalization is not source-backed"
+};
+
+const deliverabilityGateNames = new Set([
+  "sender_domain_healthy",
+  "per_domain_daily_cap",
+  "per_mailbox_ramp_stage",
+  "bounce_rate_under_threshold",
+  "complaint_rate_under_threshold",
+  "no_recent_deferral_spike"
+]);
+
+function formatBlockReason(reason?: string | null) {
+  if (!reason) return "none";
+  return blockReasonLabels[reason] ?? reason.toLowerCase().replace(/_/g, " ");
+}
+
+function formatGateName(gate: string) {
+  return gate.replace(/_/g, " ");
+}
+
+function formatPolicyDetails(details?: Record<string, unknown>) {
+  if (!details) return "";
+  const parts = ["status", "used", "daily_cap", "sent_today", "effective_cap", "count", "rate", "threshold", "window_days"]
+    .filter((key) => details[key] !== undefined && details[key] !== null)
+    .map((key) => `${key.replace(/_/g, " ")}: ${String(details[key])}`);
+  return parts.join("; ");
 }
 
 function App() {
   const [surface, setSurface] = useState<Surface>("setup");
   const queryClient = useQueryClient();
-  const data = useAppData(surface);
+  const security = useQuery({ queryKey: ["security-status"], queryFn: api.getSecurityStatus, retry: false });
+  const authEnforced = security.data?.authentication_enforced === true;
+  const authSession = useQuery({
+    queryKey: ["api-auth-session"],
+    queryFn: api.getAuthSession,
+    enabled: authEnforced,
+    retry: false
+  });
+  const authenticated = authSession.data?.authenticated === true && authSession.data?.authorized === true;
+  const authProbe = useQuery({
+    queryKey: ["api-auth-probe"],
+    queryFn: api.listProviderHealth,
+    enabled: security.isSuccess && (!authEnforced || authenticated),
+    retry: false,
+    refetchInterval: security.isSuccess && (!authEnforced || authenticated) ? 30000 : false
+  });
+  const operationalEnabled = security.isSuccess && (!authEnforced || authenticated) && authProbe.isSuccess;
+  const data = useAppData(surface, operationalEnabled);
   const settings = data.settings.data;
+  const verifications = data.verifications.data?.items ?? [];
+  const hasQueryError = [
+    data.settings,
+    data.providerHealth,
+    data.deliverability,
+    data.contacts,
+    data.recentlyDeletedContacts,
+    data.enrichmentWorkbook,
+    data.verifications,
+    data.drafts,
+    data.queue,
+    data.followups,
+    data.suppressions,
+    data.replies,
+    data.conversations,
+    data.templates,
+    data.campaigns,
+    data.workflows,
+    data.integrations,
+    data.autoReplyPending,
+    data.autoReplyLog,
+    data.audit
+  ].some((query) => query.isError);
+  const authRejected = authEnforced && (authSession.isError || (authenticated && authProbe.isError));
+  const authChecking = security.isPending || (authEnforced && (authSession.isPending || (authenticated && authProbe.isPending)));
+  const authState: "checking" | "unauthenticated" | "validating" | "authenticated" | "rejected" = authChecking
+    ? "checking"
+    : operationalEnabled
+      ? "authenticated"
+      : authRejected
+        ? "rejected"
+        : authenticated
+          ? "validating"
+          : "unauthenticated";
+  const retryAuthentication = () => {
+    void security.refetch();
+    void authSession.refetch().then((result) => {
+      if (result.data?.authenticated) void authProbe.refetch();
+    });
+  };
+  const signIn = () => {
+    window.location.assign(authenticationLoginUrl(window.location.pathname));
+  };
+  const signOut = useMutation({
+    mutationFn: api.logout,
+    onSuccess: async () => {
+      setSurface("setup");
+      queryClient.clear();
+      await Promise.all([security.refetch(), authSession.refetch()]);
+    },
+    onError: (error) => toast(apiErrorMessage(error, "Sign out failed"))
+  });
 
   useEffect(() => {
     const url = new URL(window.location.href);
@@ -265,16 +664,28 @@ function App() {
           <div className="text-sm text-muted">{settings?.gmail_user || "Sender not configured"}</div>
         </div>
         <div className="flex items-center gap-3">
+          {authEnforced && authSession.data?.authenticated && (
+            <div className="operator-summary">
+              <strong>{authSession.data.subject}</strong>
+              <span>{authSession.data.roles.join(", ")}</span>
+            </div>
+          )}
           <StatusPill value={settings?.sender_readiness ?? "not_configured"} />
           <ModeLabel settings={settings} />
-          <ListeningIndicator enabled={settings?.auto_reply_enabled} />
+          <ListeningIndicator settings={settings} />
+          {authEnforced && authSession.data?.authenticated && (
+            <button className="button secondary" disabled={signOut.isPending} onClick={() => signOut.mutate()}>
+              <LogOut className="h-4 w-4" /> {signOut.isPending ? "Signing Out..." : "Sign Out"}
+            </button>
+          )}
         </div>
       </header>
+      <RuntimeBanner security={security.data} settings={settings} session={authSession.data} authState={authState} />
 
       <div className="app-shell">
         <aside className="sidebar">
           {surfaces.map(([id, label, Icon]) => (
-            <button key={id} className={surface === id ? "nav active" : "nav"} onClick={() => setSurface(id)}>
+            <button key={id} className={surface === id ? "nav active" : "nav"} disabled={!operationalEnabled} onClick={() => setSurface(id)}>
               <Icon className="h-4 w-4" />
               <span>{label}</span>
               <ChevronRight className="ml-auto h-4 w-4 opacity-50" />
@@ -283,25 +694,45 @@ function App() {
         </aside>
 
         <main className="content">
-          {surface === "setup" && <SetupPanel settings={settings} />}
-          {surface === "health" && <HealthPanel settings={settings} providerHealth={data.providerHealth.data?.items ?? []} />}
-          {surface === "import" && <ImportPanel contactsTotal={data.contacts.data?.total ?? 0} />}
-          {surface === "contacts" && <ContactsPanel contacts={data.contacts.data?.items ?? []} recentlyDeletedContacts={data.recentlyDeletedContacts.data?.items ?? []} templates={data.templates.data?.items ?? []} settings={settings} navigate={setSurface} />}
-          {surface === "drafts" && <DraftsPanel contacts={data.contacts.data?.items ?? []} drafts={data.drafts.data?.items ?? []} templates={data.templates.data?.items ?? []} queue={data.queue.data?.items ?? []} />}
-          {surface === "templates" && <TemplatesPanel templates={data.templates.data?.items ?? []} />}
-          {surface === "campaigns" && <CampaignsPanel campaigns={data.campaigns.data?.items ?? []} contacts={data.contacts.data?.items ?? []} navigate={setSurface} />}
-          {surface === "queue" && <QueuePanel queue={data.queue.data?.items ?? []} contacts={data.contacts.data?.items ?? []} drafts={data.drafts.data?.items ?? []} />}
-          {surface === "followups" && <FollowupsPanel followups={data.followups.data?.items ?? []} navigate={setSurface} />}
-          {surface === "replies" && <RepliesPanel contacts={data.contacts.data?.items ?? []} replies={data.replies.data?.items ?? []} />}
-          {surface === "conversations" && <ConversationsPanel contacts={data.contacts.data?.items ?? []} summaries={data.conversations.data?.items ?? []} settings={settings} providerHealth={data.providerHealth.data?.items ?? []} />}
-          {surface === "autoReply" && <AutoReplyPanel pending={data.autoReplyPending.data?.items ?? []} log={data.autoReplyLog.data?.items ?? []} navigate={setSurface} settings={settings} />}
-          {surface === "suppressions" && <SuppressionsPanel suppressions={data.suppressions.data?.items ?? []} />}
-          {surface === "audit" && <AuditPanel audit={data.audit.data?.items ?? []} />}
-          {surface === "errors" && <ErrorsPanel audit={data.audit.data?.items ?? []} />}
-          {surface === "settings" && <SettingsPanel settings={settings} />}
+          {authEnforced && !operationalEnabled && (
+            <AuthenticationGate
+              security={security.data}
+              authenticated={authenticated}
+              rejected={authRejected}
+              checking={authChecking}
+              onSignIn={signIn}
+              onRetry={retryAuthentication}
+            />
+          )}
+          {operationalEnabled && data.settings.isPending && <div className="notice compact">Loading server settings...</div>}
+          {operationalEnabled && hasQueryError && (
+            <div className="notice warning compact" role="alert">
+              Some server data could not be loaded. Empty tables may be incomplete; retry after checking the backend connection.
+            </div>
+          )}
+          {operationalEnabled && surface === "setup" && <SetupPanel settings={settings} />}
+          {operationalEnabled && surface === "health" && <HealthPanel settings={settings} providerHealth={data.providerHealth.data?.items ?? []} />}
+          {operationalEnabled && surface === "deliverability" && <DeliverabilityPanel summary={data.deliverability.data} />}
+          {operationalEnabled && surface === "import" && <ImportPanel contactsTotal={data.contacts.data?.total ?? 0} />}
+          {operationalEnabled && surface === "contacts" && <ContactsPanel contacts={data.contacts.data?.items ?? []} recentlyDeletedContacts={data.recentlyDeletedContacts.data?.items ?? []} templates={data.templates.data?.items ?? []} settings={settings} navigate={setSurface} verifications={verifications} />}
+          {operationalEnabled && surface === "enrichment" && <EnrichmentPanel contacts={data.contacts.data?.items ?? []} workbook={data.enrichmentWorkbook.data} verifications={verifications} verificationSummary={data.verifications.data?.summary} />}
+          {operationalEnabled && surface === "drafts" && <DraftsPanel contacts={data.contacts.data?.items ?? []} drafts={data.drafts.data?.items ?? []} templates={data.templates.data?.items ?? []} queue={data.queue.data?.items ?? []} verifications={verifications} />}
+          {operationalEnabled && surface === "templates" && <TemplatesPanel templates={data.templates.data?.items ?? []} />}
+          {operationalEnabled && surface === "campaigns" && <CampaignsPanel campaigns={data.campaigns.data?.items ?? []} contacts={data.contacts.data?.items ?? []} navigate={setSurface} />}
+          {operationalEnabled && surface === "workflows" && <WorkflowsPanel workflows={data.workflows.data?.items ?? []} />}
+          {operationalEnabled && surface === "queue" && <QueuePanel queue={data.queue.data?.items ?? []} contacts={data.contacts.data?.items ?? []} drafts={data.drafts.data?.items ?? []} verifications={verifications} />}
+          {operationalEnabled && surface === "followups" && <FollowupsPanel followups={data.followups.data?.items ?? []} navigate={setSurface} />}
+          {operationalEnabled && surface === "replies" && <RepliesPanel contacts={data.contacts.data?.items ?? []} replies={data.replies.data?.items ?? []} />}
+          {operationalEnabled && surface === "conversations" && <ConversationsPanel contacts={data.contacts.data?.items ?? []} summaries={data.conversations.data?.items ?? []} settings={settings} providerHealth={data.providerHealth.data?.items ?? []} />}
+          {operationalEnabled && surface === "autoReply" && <AutoReplyPanel pending={data.autoReplyPending.data?.items ?? []} log={data.autoReplyLog.data?.items ?? []} navigate={setSurface} settings={settings} />}
+          {operationalEnabled && surface === "suppressions" && <SuppressionsPanel suppressions={data.suppressions.data?.items ?? []} />}
+          {operationalEnabled && surface === "audit" && <AuditPanel audit={data.audit.data?.items ?? []} />}
+          {operationalEnabled && surface === "errors" && <ErrorsPanel audit={data.audit.data?.items ?? []} />}
+          {operationalEnabled && surface === "integrations" && <IntegrationsPanel summary={data.integrations.data} contacts={data.contacts.data?.items ?? []} />}
+          {operationalEnabled && surface === "settings" && <SettingsPanel settings={settings} ready={data.settings.isSuccess} />}
         </main>
       </div>
-      <AssistantWidget />
+      {operationalEnabled && <AssistantWidget />}
     </div>
   );
 }
@@ -351,9 +782,25 @@ function SetupPanel({ settings }: { settings?: SettingsRead }) {
         <Metric label="Sender" value={settings?.gmail_user || "missing"} />
         <Metric label="Email Provider" value={settings?.sender_readiness ?? "not_configured"} />
         <Metric label="Canary" value={settings?.canary_verified ? "verified" : "not verified"} />
+        <Metric label="Auto processing" value={settings?.auto_process_effective ? "running" : "paused"} />
         <Metric label="Dry run" value={settings?.dry_run ? "enabled" : "disabled"} />
+        <Metric label="Configured transport" value={settings?.configured_transport ?? "unknown"} />
+        <Metric label="Effective transport" value={settings?.effective_transport ?? "unknown"} />
         {settings?.warm_up_mode && <Metric label="Warm-up cap" value={`${settings.warm_up_current_limit ?? settings.daily_send_cap}/day`} />}
       </div>
+      <TransportTruth settings={settings} />
+      {!settings?.auto_process_effective && (
+        <div className="notice warning mt-4">
+          <strong>Automatic queue processing is paused.</strong>
+          <div>{settings?.auto_process_block_reason?.split("_").join(" ") ?? "Enable automatic processing in Settings."}</div>
+        </div>
+      )}
+      {settings?.release_blocked && (
+        <div className="notice mt-4">
+          <strong>Release blocked</strong>
+          <div>Operational API authentication is not configured. Mode: {settings.api_security_mode}.</div>
+        </div>
+      )}
       {canary && (
         <div className="notice">
           <div>status={canary.status}</div>
@@ -387,7 +834,7 @@ function HealthPanel({ settings, providerHealth }: { settings?: SettingsRead; pr
   return (
     <Panel title="Provider Health" icon={HeartPulse}>
       <div className="grid gap-4 lg:grid-cols-4">
-        <ProviderBlock title="Gmail" status={settings?.sender_readiness ?? "unknown"} detail={settings?.gmail_user || "missing"} />
+        <ProviderBlock title="Gmail" status={settings?.sender_readiness ?? "unknown"} detail={`${settings?.gmail_user || "missing"} | configured ${settings?.configured_transport ?? "unknown"} | effective ${settings?.effective_transport ?? "unknown"}`} />
         <ProviderBlock title="Groq" status={settings?.groq_keys_count ? "configured" : "missing"} detail={`${settings?.groq_keys_count ?? 0} keys`} fingerprints={settings?.groq_keys_fingerprints ?? []} />
         <ProviderBlock title="Gemini" status={settings?.gemini_keys_count ? "configured" : "missing"} detail={`${settings?.gemini_keys_count ?? 0} keys`} fingerprints={settings?.gemini_keys_fingerprints ?? []} />
         <ProviderBlock title="IMAP" status={imap?.status ?? "unknown"} detail={imap?.details || "No fetch recorded"} fingerprints={imap?.last_checked ? [`checked ${new Date(imap.last_checked).toLocaleString()}`] : []} />
@@ -410,6 +857,555 @@ function ProviderBlock({ title, status, detail, fingerprints = [] }: { title: st
         ))}
       </div>
     </div>
+  );
+}
+
+function DeliverabilityPanel({ summary }: { summary?: DeliverabilitySummary }) {
+  const queryClient = useQueryClient();
+  const [seedEmail, setSeedEmail] = useState("");
+  const [seedSubject, setSeedSubject] = useState("Finimatic inbox placement seed");
+  const runCheck = useMutation({
+    mutationFn: api.runDeliverabilityCheck,
+    onSuccess: () => {
+      toast("deliverability check updated");
+      void queryClient.invalidateQueries({ queryKey: ["deliverability"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "deliverability check failed"))
+  });
+  const createSeed = useMutation({
+    mutationFn: () => api.createInboxPlacementTest({ seed_email: seedEmail, subject: seedSubject }),
+    onSuccess: () => {
+      setSeedEmail("");
+      toast("inbox placement test planned");
+      void queryClient.invalidateQueries({ queryKey: ["deliverability"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "seed test failed"))
+  });
+  const mailbox = summary?.mailbox;
+  const domain = summary?.domain_health;
+  const policyChecks = summary?.policy.checks ?? {};
+  return (
+    <Panel
+      title="Deliverability"
+      icon={ShieldCheck}
+      action={
+        <button className={`button primary${runCheck.isPending ? " is-loading" : ""}`} disabled={runCheck.isPending} onClick={() => runCheck.mutate()}>
+          <RefreshCw className={runCheck.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Check
+        </button>
+      }
+    >
+      <div className="metrics">
+        <Metric label="Sender" value={summary?.sender || "missing"} />
+        <Metric label="Domain" value={summary?.domain || "unknown"} />
+        <Metric label="Mailbox Health" value={mailbox?.status || "unknown"} />
+        <Metric label="Ramp Stage" value={mailbox?.ramp_stage || "low_volume"} />
+      </div>
+      <div className="notice compact">
+        Gmail API success means provider acceptance only. Recipient verification is address validity risk, seed placement is telemetry, and deliverability health is operational risk signals. None of these proves inbox placement.
+      </div>
+      <div className="ops-grid mt-4">
+        <div className="ops-card">
+          <h3>Domain Authentication</h3>
+          <div className="status-list">
+            <span>SPF <StatusPill value={domain?.spf_status || "unknown"} /></span>
+            <span>DKIM <StatusPill value={domain?.dkim_status || "unknown"} /></span>
+            <span>DMARC <StatusPill value={domain?.dmarc_status || "unknown"} /></span>
+            <span>Alignment <StatusPill value={domain?.alignment_status || "unknown"} /></span>
+          </div>
+        </div>
+        <div className="ops-card">
+          <h3>Inbox Placement Seed</h3>
+          <div className="form-grid single">
+            <label>Seed Email<input value={seedEmail} onChange={(event) => setSeedEmail(event.target.value)} /></label>
+            <label>Subject<input value={seedSubject} onChange={(event) => setSeedSubject(event.target.value)} /></label>
+          </div>
+          <button className="button secondary mt-3" disabled={!seedEmail || createSeed.isPending} onClick={() => createSeed.mutate()}>
+            <Send className="h-4 w-4" /> Plan Test
+          </button>
+        </div>
+      </div>
+      <DataTable
+        columns={["gate", "status", "reason", "details"]}
+        rows={Object.entries(policyChecks).map(([gate, check]) => [
+          formatGateName(gate),
+          check.allowed ? "pass" : "block",
+          formatBlockReason(check.reason_code),
+          formatPolicyDetails(check)
+        ])}
+      />
+      <DataTable
+        columns={["check", "status", "severity", "details", "checked"]}
+        rows={(summary?.checks ?? []).map((row) => [
+          row.check_type,
+          row.status,
+          row.severity,
+          row.details_redacted ?? "",
+          row.checked_at ? new Date(row.checked_at).toLocaleString() : ""
+        ])}
+      />
+      <DataTable
+        columns={["seed", "domain", "subject", "status", "placement"]}
+        rows={(summary?.inbox_tests ?? []).map((row) => [row.seed_email, row.recipient_domain, row.subject, row.status, row.placement])}
+      />
+      <DataTable
+        columns={["recipient domain", "used", "daily cap", "status", "last sent"]}
+        rows={(summary?.recipient_domain_caps ?? []).map((row) => [
+          row.recipient_domain,
+          String(row.sent_today),
+          String(row.daily_cap),
+          row.status,
+          row.last_sent_at ? new Date(row.last_sent_at).toLocaleString() : ""
+        ])}
+      />
+    </Panel>
+  );
+}
+
+function EnrichmentPanel({
+  contacts,
+  workbook,
+  verifications,
+  verificationSummary
+}: {
+  contacts: Contact[];
+  workbook?: EnrichmentWorkbook;
+  verifications: EmailVerification[];
+  verificationSummary?: VerificationSummary;
+}) {
+  const queryClient = useQueryClient();
+  const [selectedContactId, setSelectedContactId] = useState("");
+  useEffect(() => {
+    if (!selectedContactId && contacts[0]) setSelectedContactId(contacts[0].id);
+  }, [contacts, selectedContactId]);
+  const evidence = useQuery({
+    queryKey: ["contact-evidence", selectedContactId],
+    queryFn: () => api.getContactEvidence(selectedContactId),
+    enabled: Boolean(selectedContactId)
+  });
+  const selectedVerification = useQuery({
+    queryKey: ["contact-verification", selectedContactId],
+    queryFn: () => api.getContactVerification(selectedContactId),
+    enabled: Boolean(selectedContactId)
+  });
+  const seedEvidence = useMutation({
+    mutationFn: () => api.seedContactEvidence(selectedContactId),
+    onSuccess: async () => {
+      toast("evidence seeded from contact fields");
+      await Promise.all([
+        queryClient.refetchQueries({ queryKey: ["contact-evidence", selectedContactId] }),
+        queryClient.refetchQueries({ queryKey: ["enrichment-workbook"] })
+      ]);
+    },
+    onError: (error) => toast(apiErrorMessage(error, "evidence seed failed"))
+  });
+  const verifyContact = useMutation({
+    mutationFn: () => api.runContactVerification(selectedContactId),
+    onSuccess: () => {
+      toast("verification completed");
+      void queryClient.invalidateQueries({ queryKey: ["verifications"] });
+      void queryClient.invalidateQueries({ queryKey: ["contact-verification", selectedContactId] });
+      void queryClient.invalidateQueries({ queryKey: ["enrichment-workbook"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "verification failed"))
+  });
+  const selectedEvidence: ContactEvidence | undefined = evidence.data;
+  const verificationLookup = verificationMaps(verifications);
+  return (
+    <Panel
+      title="Enrichment"
+      icon={Search}
+      action={
+        <div className="flex flex-wrap gap-2">
+          <button className="button secondary" disabled={!selectedContactId || seedEvidence.isPending} onClick={() => seedEvidence.mutate()}>
+            <Sparkles className="h-4 w-4" /> Seed Evidence
+          </button>
+          <button className="button primary" disabled={!selectedContactId || verifyContact.isPending} onClick={() => verifyContact.mutate()}>
+            <Check className="h-4 w-4" /> Verify Email
+          </button>
+        </div>
+      }
+    >
+      <div className="metrics">
+        <Metric label="Contacts" value={String(workbook?.summary.contacts ?? contacts.length)} />
+        <Metric label="With Evidence" value={String(workbook?.summary.contacts_with_evidence ?? 0)} />
+        <Metric label="Verified/Valid" value={String(verificationSummary?.verified_or_valid ?? 0)} />
+        <Metric label="Blocked Verification" value={String(verificationSummary?.blocked ?? 0)} />
+      </div>
+      <div className="ops-grid mt-4">
+        <label>Contact<select value={selectedContactId} onChange={(event) => setSelectedContactId(event.target.value)}>{contacts.map((contact) => <option value={contact.id} key={contact.id}>{contact.creator_name || contact.business_name || contact.email}</option>)}</select></label>
+        <div className="ops-card">
+          <h3>Evidence Check</h3>
+          <div className="status-list">
+            <span>Status <StatusPill value={selectedEvidence?.evidence_check.status || "unknown"} /></span>
+            <span>Supported claims <strong>{selectedEvidence?.evidence_check.supported_claims.length ?? 0}</strong></span>
+            <span>Missing <strong>{selectedEvidence?.evidence_check.missing_evidence.join(", ") || "none"}</strong></span>
+          </div>
+        </div>
+        <div className="ops-card verification-card">
+          <VerificationDetailPanel detail={selectedVerification.data} isLoading={selectedVerification.isFetching} />
+        </div>
+      </div>
+      <DataTable
+        columns={["contact", "verification", "evidence", "stale", "draft readiness", "website"]}
+        rows={(workbook?.items ?? []).map((row) => [
+          row.email,
+          verificationLookup.byContactId.get(row.contact_id)?.status ?? verificationLookup.byEmail.get(row.email.toLowerCase())?.status ?? "unknown",
+          String(row.supported_claims),
+          String(row.stale_facts),
+          row.draft_readiness,
+          row.website ?? ""
+        ])}
+      />
+      {selectedEvidence && (
+        <DataTable
+          columns={["field", "value", "source", "confidence", "status"]}
+          rows={selectedEvidence.lead_facts.map((fact) => [fact.field_key, truncateDisplay(fact.field_value, 100), fact.source_label, String(fact.confidence), fact.status])}
+        />
+      )}
+    </Panel>
+  );
+}
+
+type EvidenceFact = LeadFact | AccountFact;
+
+function EvidenceFactList({ title, facts }: { title: string; facts: EvidenceFact[] }) {
+  return (
+    <div className="evidence-fact-block">
+      <h4>{title}</h4>
+      {!facts.length && <div className="notice compact">No facts recorded.</div>}
+      <div className="evidence-fact-list">
+        {facts.map((fact) => {
+          const sourceUrl = fact.source_url || fact.source?.url || "";
+          return (
+            <div className="evidence-fact" key={fact.id}>
+              <div className="evidence-fact-head">
+                <strong>{fact.field_key}</strong>
+                <StatusPill value={fact.freshness || fact.status} />
+              </div>
+              <div>{truncateDisplay(fact.field_value, 220)}</div>
+              <div className="evidence-meta-row">
+                <span>Source: <strong>{fact.source_label}</strong></span>
+                <span>Confidence: <strong>{Math.round((fact.confidence ?? 0) * 100)}%</strong></span>
+                <span>Status: <strong>{fact.status}</strong></span>
+              </div>
+              <div className="evidence-meta-row">
+                <span>Fetched: <strong>{fact.fetched_at ? new Date(fact.fetched_at).toLocaleDateString() : "unknown"}</strong></span>
+                <span>Expires: <strong>{fact.expires_at ? new Date(fact.expires_at).toLocaleDateString() : "none"}</strong></span>
+              </div>
+              {sourceUrl && <div className="evidence-source-url">{truncateDisplay(sourceUrl, 140)}</div>}
+              {fact.raw_snippet_redacted && <div className="evidence-snippet">{truncateDisplay(fact.raw_snippet_redacted, 240)}</div>}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function EvidenceCheckSummary({ check }: { check?: EvidenceCheck }) {
+  if (!check) return <div className="notice compact">Evidence check unavailable.</div>;
+  return (
+    <div className="evidence-check-summary">
+      <div className="status-list">
+        <span>Status <StatusPill value={check.status} /></span>
+        <span>Supported claims <strong>{check.supported_claims.length}</strong></span>
+        <span>Missing <strong>{check.missing_evidence.join(", ") || "none"}</strong></span>
+        <span>Stale/rejected facts <strong>{check.stale_facts.length}</strong></span>
+      </div>
+    </div>
+  );
+}
+
+function DraftEvidencePanel({
+  check,
+  isLoading,
+  onUseNeutral
+}: {
+  check?: EvidenceCheck;
+  isLoading: boolean;
+  onUseNeutral: () => void;
+}) {
+  const warning = Boolean(check?.neutral_copy_required);
+  const panelClass = `evidence-panel${warning ? " warning" : check?.status === "passed" ? " good" : ""}`;
+  return (
+    <div className={panelClass}>
+      <div className="evidence-panel-head">
+        <div>
+          <h3>Evidence Check</h3>
+          <p>{isLoading ? "Checking draft evidence..." : check?.policy_version || "evidence_v1"}</p>
+        </div>
+        <StatusPill value={check?.status || (isLoading ? "checking" : "unknown")} />
+      </div>
+      {check && <EvidenceCheckSummary check={check} />}
+      {warning && (
+        <div className="notice warning compact">
+          Unsupported personalization requires neutral copy before approval.
+          <div className="mt-2">
+            <button className="button secondary compact" type="button" onClick={onUseNeutral}>Use Neutral Copy</button>
+          </div>
+        </div>
+      )}
+      {check?.supported_claims.length ? <EvidenceFactList title="Usable Claims" facts={check.supported_claims.slice(0, 3)} /> : null}
+      {check?.stale_facts.length ? <EvidenceFactList title="Stale Or Rejected" facts={check.stale_facts.slice(0, 3)} /> : null}
+    </div>
+  );
+}
+
+function workflowOutputSummary(output?: Record<string, unknown> | null): string {
+  if (!output) return "";
+  if (typeof output.error_code === "string") return output.error_code;
+  if (typeof output.score === "number") return `score ${output.score}${typeof output.grade === "string" ? ` ${output.grade}` : ""}`;
+  const verification = output.verification;
+  if (verification && typeof verification === "object" && "status" in verification) {
+    return `verification ${String((verification as { status?: unknown }).status ?? "")}`;
+  }
+  const draftPreview = output.draft_preview;
+  if (draftPreview && typeof draftPreview === "object" && "subject" in draftPreview) {
+    return `draft ${String((draftPreview as { subject?: unknown }).subject ?? "")}`;
+  }
+  if (typeof output.status === "string") return output.status;
+  return truncateDisplay(JSON.stringify(output), 120);
+}
+
+function workflowEvidenceSummary(refs: string[]): string {
+  if (!refs.length) return "none";
+  const visible = refs.slice(0, 3).join(", ");
+  return refs.length > 3 ? `${visible} +${refs.length - 3}` : visible;
+}
+
+function shortHash(value?: string | null): string {
+  return value ? value.slice(0, 8) : "";
+}
+
+function WorkflowsPanel({ workflows }: { workflows: WorkflowSummary[] }) {
+  const queryClient = useQueryClient();
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState("");
+  useEffect(() => {
+    if (!selectedWorkflowId && workflows[0]) setSelectedWorkflowId(workflows[0].id);
+  }, [workflows, selectedWorkflowId]);
+  const detail = useQuery({
+    queryKey: ["workflow-detail", selectedWorkflowId],
+    queryFn: () => api.getWorkflow(selectedWorkflowId),
+    enabled: Boolean(selectedWorkflowId)
+  });
+  const run = useMutation({
+    mutationFn: () => api.runWorkflow(selectedWorkflowId),
+    onSuccess: (result) => {
+      toast(`workflow ${result.status}`);
+      void queryClient.invalidateQueries({ queryKey: ["workflow-detail", selectedWorkflowId] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "workflow run failed"))
+  });
+  const retry = useMutation({
+    mutationFn: () => api.retryWorkflow(selectedWorkflowId),
+    onSuccess: (result) => {
+      toast(`workflow retry ${result.status}`);
+      void queryClient.invalidateQueries({ queryKey: ["workflow-detail", selectedWorkflowId] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "workflow retry failed"))
+  });
+  const workflow: WorkflowDetail | undefined = detail.data;
+  const workflowRows = workflow?.rows ?? [];
+  const visibleWorkflowRows = workflowRows.slice(0, 25);
+  const cellDetails = workflow
+    ? visibleWorkflowRows.flatMap((row) =>
+        workflow.columns.map((column) => ({
+          row,
+          column,
+          cell: row.cells[column.key]
+        }))
+      )
+    : [];
+  return (
+    <Panel
+      title="Workflows"
+      icon={Activity}
+      action={
+        <div className="flex flex-wrap gap-2">
+          <button className="button secondary" disabled={!selectedWorkflowId || retry.isPending} onClick={() => retry.mutate()}>
+            <RotateCcw className="h-4 w-4" /> Retry Failed
+          </button>
+          <button className="button primary" disabled={!selectedWorkflowId || run.isPending} onClick={() => run.mutate()}>
+            <RefreshCw className={run.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Run
+          </button>
+        </div>
+      }
+    >
+      <div className="grid gap-4">
+        <label className="max-w-sm">Workbook<select value={selectedWorkflowId} onChange={(event) => setSelectedWorkflowId(event.target.value)}>{workflows.map((workflow) => <option value={workflow.id} key={workflow.id}>{workflow.name}</option>)}</select></label>
+        <div className="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>contact</th>
+                <th>row status</th>
+                {(workflow?.columns ?? []).map((column) => <th key={column.id}>{column.label}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {visibleWorkflowRows.map((row) => (
+                <tr key={row.id}>
+                  <td>{row.email}</td>
+                  <td><StatusPill value={row.status} /></td>
+                  {(workflow?.columns ?? []).map((column) => {
+                    const cell = row.cells[column.key];
+                    return (
+                      <td key={column.id}>
+                        <div className="grid gap-1">
+                          <StatusPill value={cell?.status ?? "pending"} />
+                          <span>{cell ? `${cell.cost_units} cost` : "0 cost"}</span>
+                        </div>
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <DataTable
+          columns={["contact", "step", "status", "cost", "evidence refs", "output"]}
+          rows={cellDetails.slice(0, 18).map(({ row, column, cell }) => [
+            row.email,
+            column.step_type,
+            cell?.status ?? "pending",
+            String(cell?.cost_units ?? 0),
+            workflowEvidenceSummary(cell?.evidence_refs ?? []),
+            workflowOutputSummary(cell?.output)
+          ])}
+        />
+        <DataTable
+          columns={["run", "status", "cost", "steps", "started", "completed"]}
+          rows={(workflow?.runs ?? []).map((row) => [
+            row.id.slice(0, 8),
+            row.status,
+            String(row.total_cost_units ?? 0),
+            String(row.steps?.length ?? 0),
+            row.started_at ? new Date(row.started_at).toLocaleString() : "",
+            row.completed_at ? new Date(row.completed_at).toLocaleString() : ""
+          ])}
+        />
+        <DataTable
+          columns={["attempt", "contact", "step", "status", "cost", "error", "hashes"]}
+          rows={(workflow?.attempts ?? []).slice(0, 20).map((row) => [
+            `${row.id.slice(0, 8)} #${row.attempt_num}`,
+            row.contact_email ?? "",
+            row.step_type ?? row.column_label ?? "",
+            row.status,
+            String(row.cost_units),
+            row.error_code ?? "",
+            `${shortHash(row.input_hash)} / ${shortHash(row.step_config_hash)}`
+          ])}
+        />
+      </div>
+    </Panel>
+  );
+}
+
+function IntegrationsPanel({ summary, contacts }: { summary?: IntegrationsSummary; contacts: Contact[] }) {
+  const queryClient = useQueryClient();
+  const [provider, setProvider] = useState("google_sheets");
+  const [contactId, setContactId] = useState("");
+  const [lastPreview, setLastPreview] = useState<ExternalWritePreview | null>(null);
+  useEffect(() => {
+    if (!contactId && contacts[0]) setContactId(contacts[0].id);
+  }, [contacts, contactId]);
+  const preview = useMutation({
+    mutationFn: () => api.previewIntegrationSync(provider, contactId),
+    onSuccess: (result) => {
+      setLastPreview(result);
+      toast("diff preview created");
+      void queryClient.invalidateQueries({ queryKey: ["integrations"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "integration preview failed"))
+  });
+  const activePreview = (
+    lastPreview?.status === "pending_confirmation"
+    && lastPreview.provider === provider
+    && lastPreview.entity_id === contactId
+      ? lastPreview
+      : summary?.previews?.find(
+          (row) => row.status === "pending_confirmation" && row.provider === provider && row.entity_id === contactId
+        )
+  ) ?? null;
+  const confirm = useMutation({
+    mutationFn: () => api.confirmIntegrationSync(activePreview?.provider ?? provider, activePreview?.id ?? ""),
+    onSuccess: () => {
+      setLastPreview(null);
+      toast("sync journal recorded");
+      void queryClient.invalidateQueries({ queryKey: ["integrations"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "integration confirmation failed"))
+  });
+  const cancel = useMutation({
+    mutationFn: () => api.cancelIntegrationSync(activePreview?.provider ?? provider, activePreview?.id ?? ""),
+    onSuccess: () => {
+      setLastPreview(null);
+      toast("preview cancelled");
+      void queryClient.invalidateQueries({ queryKey: ["integrations"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "integration cancel failed"))
+  });
+  const previewRows = (activePreview?.diff.fields ?? []).map((field) => [
+    field.local_field ?? field.field ?? "",
+    field.external_field ?? "",
+    field.before == null ? "" : String(field.before),
+    field.after == null ? "" : String(field.after),
+    field.status
+  ]);
+  const activePolicy = activePreview?.diff.policy ?? {};
+  return (
+    <Panel
+      title="Integrations"
+      icon={KeyRound}
+      action={
+        <div className="flex flex-wrap gap-2">
+          <button className="button secondary" disabled={!contactId || preview.isPending} onClick={() => preview.mutate()}>
+            <Search className="h-4 w-4" /> Preview Sync
+          </button>
+          <button className="button primary" disabled={!activePreview || confirm.isPending} onClick={() => confirm.mutate()}>
+            <Check className="h-4 w-4" /> Confirm Dry-Run
+          </button>
+          <button className="button danger" disabled={!activePreview || cancel.isPending} onClick={() => cancel.mutate()}>
+            <X className="h-4 w-4" /> Cancel Preview
+          </button>
+        </div>
+      }
+    >
+      <div className="form-grid">
+        <label>Provider<select value={provider} onChange={(event) => setProvider(event.target.value)}><option value="google_sheets">Google Sheets</option><option value="hubspot">HubSpot</option><option value="salesforce">Salesforce</option></select></label>
+        <label>Contact<select value={contactId} onChange={(event) => setContactId(event.target.value)}>{contacts.map((contact) => <option value={contact.id} key={contact.id}>{contact.creator_name || contact.business_name || contact.email}</option>)}</select></label>
+      </div>
+      <div className="notice">
+        Local dry-run only until OAuth/provider credentials are connected. Preview creates a diff without writing externally; confirm records an idempotent journal and attempt for audit.
+      </div>
+      <DataTable
+        columns={["provider", "account", "status", "auth mode", "credential scope"]}
+        rows={(summary?.connections ?? []).map((row) => [row.provider, row.account_label, row.status, row.auth_mode, row.scopes_redacted ?? "backend only"])}
+      />
+      <DataTable
+        columns={["provider", "local field", "external field", "direction", "status"]}
+        rows={(summary?.mappings ?? []).map((row) => [row.provider, row.local_field, row.external_field, row.direction, row.status])}
+      />
+      {activePreview && (
+        <div className="notice">
+          Active diff: {activePreview.provider} {activePreview.action} for {activePreview.entity_type}. Confirmation required: {String(activePolicy.requires_confirmation)}. External write in this phase: {activePolicy.dry_run_only ? "local dry-run only" : "backend-managed"}.
+        </div>
+      )}
+      <DataTable columns={["local field", "external field", "before", "after", "status"]} rows={previewRows} />
+      <DataTable
+        columns={["provider", "entity", "action", "status", "idempotency"]}
+        rows={(summary?.previews ?? []).map((row) => [row.provider, row.entity_type, row.action, row.status, row.idempotency_key.slice(0, 12)])}
+      />
+      <DataTable
+        columns={["provider", "status", "response", "error", "external id", "idempotency"]}
+        rows={(summary?.attempts ?? []).map((row) => [row.provider, row.status, row.response_code ?? "", row.error_code ?? "", row.external_id ?? "", row.idempotency_key.slice(0, 12)])}
+      />
+      <DataTable
+        columns={["provider", "entity", "action", "status", "external id", "idempotency"]}
+        rows={(summary?.journals ?? []).map((row) => [row.provider, row.entity_type, row.action, row.status, row.external_id ?? "", row.idempotency_key.slice(0, 12)])}
+      />
+    </Panel>
   );
 }
 
@@ -464,33 +1460,6 @@ function ImportPanel({ contactsTotal }: { contactsTotal: number }) {
     },
     onError: (error) => toast(apiErrorMessage(error, "import commit failed"))
   });
-  const submit = useMutation({
-    mutationFn: async () => {
-      const result = await api.previewImport({
-        format: paste ? "paste" : "manual",
-        rows: paste ? undefined : [{ email, creator_name: name, website_url: website, notes, tags, personalization: info, source: "manual" }],
-        content: paste || undefined
-      });
-      setPreview(result);
-      return api.commitImport(result.batch_id_temp);
-    },
-    onSuccess: (result) => {
-      setPreview(null);
-      setCommitted(result);
-      toast(importSummaryToast(result.summary));
-      setEmail("");
-      setName("");
-      setWebsite("");
-      setNotes("");
-      setTags("");
-      setInfo("");
-      setFileName("");
-      setFileContent("");
-      setFileFormat("");
-      invalidateAll(queryClient);
-    },
-    onError: (error) => toast(apiErrorMessage(error, "contact submit failed"))
-  });
   return (
     <Panel title="Import" icon={FileUp} action={<span className="text-sm text-muted">{contactsTotal} contacts</span>}>
       <div className="form-grid">
@@ -508,14 +1477,14 @@ function ImportPanel({ contactsTotal }: { contactsTotal: number }) {
       {fileName && <div className="mt-2 text-sm text-muted">Loaded {fileName}</div>}
       <label className="mt-4 block">Paste<textarea rows={4} value={paste} onChange={(e) => setPaste(e.target.value)} /></label>
       <div className="mt-4 flex gap-2">
-        <button className={`button secondary${previewMutation.isPending ? " is-loading" : ""}`} disabled={previewMutation.isPending || commit.isPending || submit.isPending} onClick={() => previewMutation.mutate(undefined)}>
+        <button className={`button secondary${previewMutation.isPending ? " is-loading" : ""}`} disabled={previewMutation.isPending || commit.isPending} onClick={() => previewMutation.mutate(undefined)}>
           <RefreshCw className={previewMutation.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{previewMutation.isPending ? "Previewing..." : "Preview"}</span>
         </button>
-        <button className={`button primary${commit.isPending ? " is-loading" : ""}`} disabled={!preview || commit.isPending || previewMutation.isPending || submit.isPending} onClick={() => preview && commit.mutate(preview.batch_id_temp)}>
+        <button className={`button primary${commit.isPending ? " is-loading" : ""}`} disabled={!preview || commit.isPending || previewMutation.isPending} onClick={() => preview && commit.mutate(preview.batch_id_temp)}>
           <Check className={commit.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{commit.isPending ? "Committing..." : "Commit"}</span>
         </button>
-        <button className={`button primary${submit.isPending ? " is-loading" : ""}`} disabled={submit.isPending || previewMutation.isPending || commit.isPending} onClick={() => submit.mutate()}>
-          <Send className={submit.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{submit.isPending ? "Submitting..." : "Submit"}</span>
+        <button className="button secondary" disabled={!preview || previewMutation.isPending || commit.isPending} onClick={() => setPreview(null)}>
+          <X className="h-4 w-4" /> Cancel Preview
         </button>
       </div>
       {committed && <ImportSummary summary={committed.summary} />}
@@ -600,15 +1569,18 @@ function ContactsPanel({
   recentlyDeletedContacts,
   templates,
   settings,
-  navigate
+  navigate,
+  verifications
 }: {
   contacts: Contact[];
   recentlyDeletedContacts: Contact[];
   templates: TemplateRow[];
   settings?: SettingsRead;
   navigate: (surface: Surface) => void;
+  verifications: EmailVerification[];
 }) {
   const queryClient = useQueryClient();
+  const verificationLookup = verificationMaps(verifications);
   const allTags = Array.from(new Set(contacts.flatMap(tagsFor))).sort();
   const [tagFilter, setTagFilter] = useState("");
   const [bulkOpen, setBulkOpen] = useState(false);
@@ -618,9 +1590,10 @@ function ContactsPanel({
   const [bulkMode, setBulkMode] = useState<BulkDraftMode>("ai_only");
   const [bulkTemplateId, setBulkTemplateId] = useState("");
   const [bulkInstruction, setBulkInstruction] = useState("");
-  const [bulkJob, setBulkJob] = useState<{ job_id: string; status: string; total: number; completed: number; generated: number; failed: number; skipped: number; mode?: string; errors?: string[] } | null>(null);
+  const [bulkJob, setBulkJob] = useState<BulkJob | null>(null);
   const [selectedContactIds, setSelectedContactIds] = useState<string[]>([]);
   const [deleteConfirmContacts, setDeleteConfirmContacts] = useState<Contact[]>([]);
+  const [evidenceContactId, setEvidenceContactId] = useState<string | null>(null);
   useEffect(() => {
     setBulkTone(settings?.sender_tone ?? "Professional");
   }, [settings?.sender_tone]);
@@ -637,11 +1610,23 @@ function ContactsPanel({
   const bulkSourceLabel = selectedDraftableContacts.length ? `${selectedDraftableContacts.length} selected contact${selectedDraftableContacts.length === 1 ? "" : "s"}` : "all draftable contacts";
   const needsBulkTemplate = bulkMode !== "ai_only";
   const bulkTemplateMissing = needsBulkTemplate && !bulkTemplateId;
+  const selectedBulkTemplate = templates.find((template) => template.id === bulkTemplateId);
   const selectedDraftButtonTitle = selectedContacts.length && !selectedDraftableContacts.length
     ? "Selected contacts are already sent, paused, blocked, deleted, or otherwise not draftable."
     : selectedExcludedCount
       ? `${selectedExcludedCount} selected contact${selectedExcludedCount === 1 ? "" : "s"} will be excluded because their status is not draftable.`
       : "Generate drafts for selected draftable contacts.";
+  const evidenceContact = contacts.find((contact) => contact.id === evidenceContactId);
+  const evidenceDrawer = useQuery({
+    queryKey: ["contact-evidence-drawer", evidenceContactId],
+    queryFn: () => api.getContactEvidence(evidenceContactId || ""),
+    enabled: Boolean(evidenceContactId)
+  });
+  const verificationDrawer = useQuery({
+    queryKey: ["contact-verification", evidenceContactId],
+    queryFn: () => api.getContactVerification(evidenceContactId || ""),
+    enabled: Boolean(evidenceContactId)
+  });
   useEffect(() => {
     setSelectedContactIds((current) => current.filter((id) => contacts.some((contact) => contact.id === id)));
   }, [contacts]);
@@ -675,6 +1660,14 @@ function ContactsPanel({
     },
     onError: (error) => toast(apiErrorMessage(error, "contact restore failed"))
   });
+  const verifySelected = useMutation({
+    mutationFn: () => api.runSelectedVerification(selectedContactIds),
+    onSuccess: () => {
+      toast(`${selectedContactIds.length} contact${selectedContactIds.length === 1 ? "" : "s"} verified`);
+      void queryClient.invalidateQueries({ queryKey: ["verifications"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "selected verification failed"))
+  });
   const startBulk = useMutation({
     mutationFn: () => api.generateBulkDrafts({
       contact_ids: bulkContacts.map((contact) => contact.id),
@@ -697,7 +1690,7 @@ function ContactsPanel({
       setBulkJob(next);
       if (next.status === "completed") {
         window.clearInterval(timer);
-        toast(`${next.generated} drafts generated. ${next.skipped} skipped. ${next.failed} failed.`);
+        toast(`${next.generated} drafts generated: ${next.created ?? 0} created, ${next.updated ?? 0} updated, ${next.skipped} skipped, ${next.failed} failed.`);
         setBulkOpen(false);
         invalidateAll(queryClient);
         navigate("drafts");
@@ -752,6 +1745,14 @@ function ContactsPanel({
           <Sparkles className="h-4 w-4" /> Generate selected
         </button>
         <button
+          className="button secondary"
+          type="button"
+          disabled={!selectedContactIds.length || verifySelected.isPending}
+          onClick={() => verifySelected.mutate()}
+        >
+          <Check className={verifySelected.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Verify selected
+        </button>
+        <button
           className="button danger"
           type="button"
           disabled={!selectedContacts.length || deleteContact.isPending}
@@ -773,7 +1774,7 @@ function ContactsPanel({
                   onChange={() => setSelectedContactIds(allVisibleSelected ? selectedContactIds.filter((id) => !filteredContactIds.includes(id)) : Array.from(new Set([...selectedContactIds, ...filteredContactIds])))}
                 />
               </th>
-              <th>email</th><th>name</th><th>website</th><th>info</th><th>status</th><th>source</th><th>tags</th><th>auto-reply</th><th>actions</th>
+              <th>email</th><th>verification</th><th>name</th><th>website</th><th>info</th><th>status</th><th>source</th><th>tags</th><th>auto-reply</th><th>actions</th>
             </tr>
           </thead>
           <tbody>
@@ -790,6 +1791,7 @@ function ContactsPanel({
                   />
                 </td>
                 <td>{row.email}</td>
+                <td><VerificationBadge verification={verificationLookup.byContactId.get(row.id) ?? verificationLookup.byEmail.get(row.email.toLowerCase())} /></td>
                 <td>{row.creator_name || row.business_name || ""}</td>
                 <td>{truncateDisplay(row.website_url ?? "", 80)}</td>
                 <td>{truncateDisplay(row.personalization || row.notes || "", 120)}</td>
@@ -809,6 +1811,14 @@ function ContactsPanel({
                 </td>
                 <td>
                   <button
+                    className="button secondary"
+                    type="button"
+                    title={`Open evidence for ${row.email}`}
+                    onClick={() => setEvidenceContactId(row.id)}
+                  >
+                    <Database className="h-4 w-4" /> Evidence
+                  </button>
+                  <button
                     className="button danger"
                     type="button"
                     disabled={deleteContact.isPending}
@@ -822,7 +1832,7 @@ function ContactsPanel({
             ))}
             {!filteredContacts.length && (
               <tr>
-                <td colSpan={10}>No active contacts match this filter.</td>
+                <td colSpan={11}>No active contacts match this filter.</td>
               </tr>
             )}
           </tbody>
@@ -849,6 +1859,31 @@ function ContactsPanel({
               </button>
             </div>
           </div>
+        </div>
+      )}
+      {evidenceContactId && (
+        <div className="evidence-drawer-backdrop" role="presentation" onClick={() => setEvidenceContactId(null)}>
+          <aside className="evidence-drawer" role="dialog" aria-modal="true" aria-labelledby="contact-evidence-title" onClick={(event) => event.stopPropagation()}>
+            <div className="evidence-drawer-head">
+              <div>
+                <h3 id="contact-evidence-title">Evidence Ledger</h3>
+                <p>{evidenceContact?.email ?? "Contact"}</p>
+              </div>
+              <button className="button secondary compact" type="button" title="Close evidence drawer" onClick={() => setEvidenceContactId(null)}>
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            {evidenceDrawer.isLoading && <div className="notice compact">Loading evidence...</div>}
+            {evidenceDrawer.isError && <div className="notice warning compact">Evidence could not be loaded.</div>}
+            {evidenceDrawer.data && (
+              <div className="evidence-drawer-body">
+                <VerificationDetailPanel detail={verificationDrawer.data} isLoading={verificationDrawer.isFetching} />
+                <EvidenceCheckSummary check={evidenceDrawer.data.evidence_check} />
+                <EvidenceFactList title="Lead Facts" facts={evidenceDrawer.data.lead_facts} />
+                <EvidenceFactList title="Account Facts" facts={evidenceDrawer.data.account_facts} />
+              </div>
+            )}
+          </aside>
         </div>
       )}
       <div className="deleted-section">
@@ -927,8 +1962,13 @@ function ContactsPanel({
               <div className="notice">Cluster source: {bulkSourceLabel}</div>
               {selectedExcludedCount > 0 && <div className="notice warning">{selectedExcludedCount} selected contact{selectedExcludedCount === 1 ? "" : "s"} excluded because their status is not draftable.</div>}
               {bulkTemplateMissing && <div className="notice warning">Choose a template before starting this bulk mode.</div>}
+              {selectedBulkTemplate && (
+                <div className="notice compact">
+                  Template: {selectedBulkTemplate.name}. Tokens such as {"{{first_name}}"}, {"{{full_name}}"}, {"{{website}}"}, notes, tags, and custom fields resolve per contact.
+                </div>
+              )}
               <div className="notice">Will generate drafts for {bulkContacts.length} contacts. Existing unapproved drafts are skipped.</div>
-              {bulkJob && <div className="notice">Generating drafts... {bulkJob.completed} / {bulkJob.total} complete</div>}
+              {bulkJob && <div className="notice">Generating drafts... {bulkJob.completed} / {bulkJob.total} complete. {bulkJob.generated} generated, {bulkJob.skipped} skipped.</div>}
               {bulkJob?.errors?.length ? <div className="notice warning">Recent job notices: {bulkJob.errors.slice(0, 3).join(", ")}</div> : null}
             </div>
             <div className="mt-4 flex justify-end gap-2">
@@ -985,7 +2025,7 @@ function resolveTokensForContact(text: string, contact?: Contact): string {
   });
 }
 
-function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact[]; drafts: Draft[]; templates: TemplateRow[]; queue: QueueEntry[] }) {
+function DraftsPanel({ contacts, drafts, templates, queue, verifications }: { contacts: Contact[]; drafts: Draft[]; templates: TemplateRow[]; queue: QueueEntry[]; verifications: EmailVerification[] }) {
   const queryClient = useQueryClient();
   const [contactId, setContactId] = useState(contacts[0]?.id ?? "");
   const [provider, setProvider] = useState("auto");
@@ -996,9 +2036,14 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
   const [activeDraftId, setActiveDraftId] = useState("");
   const [selectedDrafts, setSelectedDrafts] = useState<string[]>([]);
   const [generateMessage, setGenerateMessage] = useState("");
+  const [evidenceDraft, setEvidenceDraft] = useState({ subject, body });
   useEffect(() => {
     if (!contactId && contacts[0]?.id) setContactId(contacts[0].id);
   }, [contacts, contactId]);
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setEvidenceDraft({ subject, body }), 350);
+    return () => window.clearTimeout(timeout);
+  }, [subject, body]);
   useEffect(() => {
     if (!generateMessage) return undefined;
     const timeout = window.setTimeout(() => setGenerateMessage(""), 5000);
@@ -1006,6 +2051,28 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
   }, [generateMessage]);
   const selectedContact = contacts.find((item) => item.id === contactId);
   const activeDraft = activeDraftId ? drafts.find((draft) => draft.id === activeDraftId) : undefined;
+  const verificationLookup = verificationMaps(verifications);
+  const selectedVerificationRow = selectedContact ? verificationLookup.byContactId.get(selectedContact.id) ?? verificationLookup.byEmail.get(selectedContact.email.toLowerCase()) : undefined;
+  const selectedVerification = useQuery({
+    queryKey: ["contact-verification", contactId],
+    queryFn: () => api.getContactVerification(contactId),
+    enabled: Boolean(contactId)
+  });
+  const runDraftVerification = useMutation({
+    mutationFn: () => api.runContactVerification(contactId),
+    onSuccess: () => {
+      toast("recipient verification updated");
+      void queryClient.invalidateQueries({ queryKey: ["contact-verification", contactId] });
+      void queryClient.invalidateQueries({ queryKey: ["verifications"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "recipient verification failed"))
+  });
+  const draftEvidence = useQuery({
+    queryKey: ["draft-evidence-check", contactId, evidenceDraft.subject, evidenceDraft.body],
+    queryFn: () => api.checkContactEvidence(contactId, evidenceDraft),
+    enabled: Boolean(contactId && (evidenceDraft.subject.trim() || evidenceDraft.body.trim())),
+    staleTime: 1000
+  });
   const unapproved = drafts.filter((draft) => !draft.approved);
   const selectedAll = unapproved.length > 0 && unapproved.every((draft) => selectedDrafts.includes(draft.id));
   const create = useMutation({
@@ -1074,10 +2141,20 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
   const approveBulk = useMutation({
     mutationFn: () => api.approveBulkDrafts(selectedDrafts),
     onSuccess: (result) => {
-      toast(`${result.approved} drafts approved and queued for bulk processing.`);
+      toast(bulkApprovalToast(result));
       setSelectedDrafts([]);
       invalidateAll(queryClient);
-    }
+    },
+    onError: (error) => toast(apiErrorMessage(error, "bulk approval failed"))
+  });
+  const approveBulkAndSend = useMutation({
+    mutationFn: () => api.approveBulkDraftsAndSend(selectedDrafts),
+    onSuccess: (result) => {
+      toast(bulkApprovalToast(result));
+      setSelectedDrafts([]);
+      invalidateAll(queryClient);
+    },
+    onError: (error) => toast(apiErrorMessage(error, "bulk approve and send failed"))
   });
   function toggleAllUnapproved(checked: boolean) {
     setSelectedDrafts(checked ? unapproved.map((draft) => draft.id) : []);
@@ -1102,15 +2179,32 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
   }, [templateId, contactId, templates, contacts]);
   function nextSequenceForContact(targetContactId: string) {
     const contactQueue = queue.filter((row) => row.contact_id === targetContactId);
-    const hasSentInitial = contactQueue.some((row) => row.sequence_num === 1 && row.status === "sent");
+    const hasSentInitial = contactQueue.some((row) => row.sequence_num === 1 && row.status === "provider_accepted");
     if (!hasSentInitial) return undefined;
-    const retryable = [...contactQueue].sort((a, b) => a.sequence_num - b.sequence_num).find((row) => row.sequence_num > 1 && ["failed", "blocked"].includes(row.status));
-    if (retryable) return retryable.sequence_num;
-    return Math.max(...contactQueue.map((row) => row.sequence_num), 1) + 1;
+    const bySequence = new Map(contactQueue.map((row) => [row.sequence_num, row]));
+    let sequenceNum = 2;
+    while (true) {
+      const row = bySequence.get(sequenceNum);
+      if (!row) return sequenceNum;
+      if (["failed", "blocked", "skipped", "simulated", "cancelled"].includes(row.status)) return sequenceNum;
+      if (["provider_accepted", "sent"].includes(row.status)) {
+        sequenceNum += 1;
+        continue;
+      }
+      return undefined;
+    }
   }
   const activeDraftApproved = Boolean(activeDraft?.approved);
   const editorApproveSequence = contactId ? nextSequenceForContact(contactId) : undefined;
   const editorApproveLabel = editorApproveSequence ? `Approve Follow-up #${editorApproveSequence}` : "Approve & Send";
+  const evidenceBlocksApproval = Boolean(draftEvidence.data?.neutral_copy_required);
+  const verificationBlocksApproval = selectedVerification.data?.policy.allowed === false;
+  function applyNeutralCopy() {
+    if (!draftEvidence.data) return;
+    if (draftEvidence.data.neutral_subject) setSubject(draftEvidence.data.neutral_subject);
+    if (draftEvidence.data.neutral_body) setBody(draftEvidence.data.neutral_body);
+    setGenerateMessage("Neutral copy applied from the evidence check.");
+  }
   return (
     <Panel
       title="Drafts"
@@ -1118,8 +2212,11 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
       action={
         <div className="flex flex-wrap items-center gap-2">
           <label className="toggle"><input type="checkbox" checked={selectedAll} onChange={(e) => toggleAllUnapproved(e.target.checked)} /> Select All Unapproved</label>
-          <button className="button primary" disabled={!selectedDrafts.length || approveBulk.isPending} onClick={() => approveBulk.mutate()}>
+          <button className="button secondary" disabled={!selectedDrafts.length || approveBulk.isPending || approveBulkAndSend.isPending} onClick={() => approveBulk.mutate()}>
             <Check className={approveBulk.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Approve Selected
+          </button>
+          <button className="button primary" disabled={!selectedDrafts.length || approveBulk.isPending || approveBulkAndSend.isPending} onClick={() => approveBulkAndSend.mutate()}>
+            <Mail className={approveBulkAndSend.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Approve & Send Selected
           </button>
         </div>
       }
@@ -1155,6 +2252,19 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
               </div>
             )}
           </div>
+          <div className={`verification-gate ${verificationBlocksApproval ? "block" : "open"}`}>
+            <div>
+              <h3>Recipient Verification</h3>
+              <p>Address validity gate only, not inbox placement.</p>
+            </div>
+            <div className="verification-gate-actions">
+              <VerificationBadge verification={selectedVerification.data?.verification ?? selectedVerificationRow} policy={selectedVerification.data?.policy} />
+              {selectedVerification.data?.policy.reason_code && <span className="fingerprint">{selectedVerification.data.policy.reason_code}</span>}
+              <button className="button secondary compact" type="button" disabled={!contactId || runDraftVerification.isPending} onClick={() => runDraftVerification.mutate()}>
+                <RefreshCw className={runDraftVerification.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Check
+              </button>
+            </div>
+          </div>
           <label className="draft-instruction">
             Draft instruction
             <textarea
@@ -1174,12 +2284,13 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
             <input placeholder="Subject" value={subject} onChange={(e) => setSubject(e.target.value)} />
             <textarea rows={9} placeholder="Body" value={body} onChange={(e) => setBody(e.target.value)} />
           </div>
+          <DraftEvidencePanel check={draftEvidence.data} isLoading={draftEvidence.isFetching} onUseNeutral={applyNeutralCopy} />
           <div className="draft-composer-actions">
             <button className={`button secondary${generate.isPending ? " is-loading" : ""}`} disabled={!contactId || generate.isPending} aria-busy={generate.isPending} onClick={() => generate.mutate()}>
               <Sparkles className={generate.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{generate.isPending ? "Generating..." : "Generate"}</span>
             </button>
             <button className="button primary" disabled={!contactId || create.isPending} onClick={() => create.mutate()}><Mail className={create.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Save Draft</button>
-            <button className="button primary" disabled={!activeDraftId || activeDraftApproved || approveEditorDraft.isPending} onClick={() => approveEditorDraft.mutate()}>
+            <button className="button primary" disabled={!activeDraftId || activeDraftApproved || approveEditorDraft.isPending || evidenceBlocksApproval || verificationBlocksApproval} onClick={() => approveEditorDraft.mutate()}>
               <Check className={approveEditorDraft.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> {editorApproveLabel}
             </button>
           </div>
@@ -1210,6 +2321,7 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
                 approve={(draftId) => approve.mutate({ draftId, sequenceNum: nextSequenceForContact(draft.contact_id) })}
                 approvePending={approve.isPending && approve.variables?.draftId === draft.id}
                 approveSequence={nextSequenceForContact(draft.contact_id)}
+                verification={verificationForContact(contacts.find((contact) => contact.id === draft.contact_id), verifications)}
                 loadIntoComposer={(draftToLoad) => {
                   const contact = contacts.find((item) => item.id === draftToLoad.contact_id);
                   setContactId(draftToLoad.contact_id);
@@ -1227,7 +2339,7 @@ function DraftsPanel({ contacts, drafts, templates, queue }: { contacts: Contact
   );
 }
 
-function DraftRow({ draft, contact, selected, onSelect, approve, approvePending, approveSequence, loadIntoComposer }: { draft: Draft; contact?: Contact; selected: boolean; onSelect: (checked: boolean) => void; approve: (draftId: string) => void; approvePending: boolean; approveSequence?: number; loadIntoComposer: (draft: Draft) => void }) {
+function DraftRow({ draft, contact, selected, onSelect, approve, approvePending, approveSequence, verification, loadIntoComposer }: { draft: Draft; contact?: Contact; selected: boolean; onSelect: (checked: boolean) => void; approve: (draftId: string) => void; approvePending: boolean; approveSequence?: number; verification?: EmailVerification; loadIntoComposer: (draft: Draft) => void }) {
   const queryClient = useQueryClient();
   const [subject, setSubject] = useState(draft.subject);
   const [body, setBody] = useState(resolveTokensForContact(draft.body, contact));
@@ -1271,7 +2383,10 @@ function DraftRow({ draft, contact, selected, onSelect, approve, approvePending,
         </div>
         <button className="button secondary compact" type="button" onClick={() => loadIntoComposer(draft)}>Load</button>
       </div>
-      <div className="draft-card-contact">{contact?.email ?? "unknown contact"}{draft.approved_at ? ` · approved ${draft.approved_at}` : ""}</div>
+      <div className="draft-card-contact">
+        <span>{contact?.email ?? "unknown contact"}{draft.approved_at ? ` - approved ${draft.approved_at}` : ""}</span>
+        <VerificationBadge verification={verification} />
+      </div>
       <label>Subject<input value={subject} onChange={(e) => setSubject(e.target.value)} /></label>
       <div className="flex flex-wrap gap-2">
         <button className="button secondary" disabled={!draft.body || suggest.isPending} onClick={() => suggest.mutate()}>
@@ -1286,7 +2401,7 @@ function DraftRow({ draft, contact, selected, onSelect, approve, approvePending,
         <button className="button secondary" onClick={() => save.mutate()}>Save</button>
         <button className="button secondary" disabled={!draft.approved || saveTemplate.isPending} onClick={promptTemplateName}>Save as Template</button>
         <button className={`button primary${approvePending ? " is-loading" : ""}`} disabled={draft.approved || approvePending} onClick={() => approve(draft.id)}>
-          <Check className={approvePending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{approvePending ? "Sending..." : approveSequence ? `Approve Follow-up #${approveSequence}` : "Approve"}</span>
+          <Check className={approvePending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{approvePending ? "Sending..." : approveSequence ? `Approve & Send Follow-up #${approveSequence}` : "Approve & Send"}</span>
         </button>
       </div>
     </div>
@@ -1515,11 +2630,13 @@ function CampaignsPanel({ campaigns, contacts, navigate }: { campaigns: Campaign
   );
 }
 
-function QueuePanel({ queue, contacts, drafts }: { queue: QueueEntry[]; contacts: Contact[]; drafts: Draft[] }) {
+function QueuePanel({ queue, contacts, drafts, verifications }: { queue: QueueEntry[]; contacts: Contact[]; drafts: Draft[]; verifications: EmailVerification[] }) {
   const queryClient = useQueryClient();
   const [statusFilter, setStatusFilter] = useState("all");
+  const [pendingAction, setPendingAction] = useState("");
   const contactById = new Map(contacts.map((contact) => [contact.id, contact]));
   const draftById = new Map(drafts.map((draft) => [draft.id, draft]));
+  const verificationLookup = verificationMaps(verifications);
   const filteredQueue = statusFilter === "all" ? queue : queue.filter((row) => row.status === statusFilter);
   const statusCounts = queue.reduce<Record<string, number>>((acc, row) => {
     acc[row.status] = (acc[row.status] ?? 0) + 1;
@@ -1528,23 +2645,70 @@ function QueuePanel({ queue, contacts, drafts }: { queue: QueueEntry[]; contacts
   const process = useMutation({
     mutationFn: api.processQueue,
     onSuccess: (result) => {
-      toast(`Queue processed: ${result.processed} processed, ${result.sent} sent, ${result.skipped} skipped, ${result.blocked} blocked, ${result.deferred ?? 0} deferred`);
+      toast(queueProcessToast(result));
       invalidateAll(queryClient);
-    }
+    },
+    onError: (error) => toast(apiErrorMessage(error, "Queue processing failed"))
+  });
+  const clear = useMutation({
+    mutationFn: api.clearQueue,
+    onSuccess: (result) => {
+      toast(`Queue cleared: ${result.cancelled} cancelled, ${result.preserved_accepted} accepted preserved, ${result.preserved_uncertain} uncertain preserved`);
+      invalidateAll(queryClient);
+    },
+    onError: (error) => toast(apiErrorMessage(error, "Queue clear failed"))
+  });
+  const rowAction = useMutation({
+    mutationFn: async ({ queueId, action }: { queueId: string; action: "send_now" | "retry" | "cancel" | "remove" | "cancel_uncertain" | "finalize_provider_accepted" }) => {
+      setPendingAction(`${queueId}:${action}`);
+      if (action === "send_now") return api.sendQueueNow(queueId);
+      if (action === "retry") return api.retryQueue(queueId);
+      if (action === "cancel") return api.cancelQueue(queueId);
+      if (action === "remove") return api.deleteQueueEntry(queueId);
+      return api.reconcileQueue(queueId, action === "cancel_uncertain" ? "cancel" : action);
+    },
+    onSuccess: (result, variables) => {
+      const label = variables.action === "send_now"
+        ? "send-now evaluated"
+        : variables.action === "retry"
+        ? "retry scheduled"
+        : variables.action === "remove"
+          ? "removed"
+        : variables.action === "cancel" || variables.action === "cancel_uncertain"
+          ? "cancelled"
+          : "provider acceptance finalized";
+      if (variables.action === "send_now" && "result" in result) {
+        toast(queueProcessToast(result.result));
+      } else {
+        toast(`Queue ${label}: ${"status" in result ? result.status : result.delivery_status}`);
+      }
+      invalidateAll(queryClient);
+    },
+    onError: (error, variables) => toast(apiErrorMessage(error, `Queue ${variables.action.replace(/_/g, " ")} failed`)),
+    onSettled: () => setPendingAction("")
   });
   return (
     <Panel
       title="Queue"
       icon={ListChecks}
       action={
-        <button className="button primary" disabled={process.isPending} onClick={() => process.mutate()}>
-          <RefreshCw className={process.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Process
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button
+            className="button danger"
+            disabled={clear.isPending || process.isPending || rowAction.isPending || !queue.some((row) => ["pending", "skipped", "simulated", "blocked", "failed"].includes(row.status))}
+            onClick={() => window.confirm("Clear all cancellable Queue work? Accepted and uncertain provider records will be preserved.") && clear.mutate()}
+          >
+            <Trash2 className={clear.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Clear Queue
+          </button>
+          <button className="button primary" disabled={process.isPending || rowAction.isPending || clear.isPending} onClick={() => process.mutate()}>
+            <RefreshCw className={process.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Process
+          </button>
+        </div>
       }
     >
       <div className="queue-toolbar">
         <div className="metrics queue-summary">
-          {["pending", "processing", "blocked", "failed", "sent", "skipped", "cancelled"].map((status) => (
+          {["pending", "processing", "simulated", "provider_accepted", "sent", "blocked", "failed", "reconciliation_required", "cancelled"].map((status) => (
             <Metric key={status} label={status} value={String(statusCounts[status] ?? 0)} />
           ))}
         </div>
@@ -1555,18 +2719,114 @@ function QueuePanel({ queue, contacts, drafts }: { queue: QueueEntry[]; contacts
           </select>
         </label>
       </div>
+      <div className="notice compact">
+        Pending items wait for the canary, send window, and spacing automatically. Retry is for failed or permanently blocked items where the provider was not contacted.
+      </div>
       {!filteredQueue.length && <div className="notice">No queue entries match this status.</div>}
-      <DataTable
-        columns={["status", "contact", "subject", "sequence", "scheduled", "blocks"]}
-        rows={filteredQueue.map((row) => [
-          row.status,
-          row.contact_email ?? contactById.get(row.contact_id)?.email ?? row.contact_id,
-          row.draft_subject ?? draftById.get(row.draft_id)?.subject ?? row.draft_id,
-          String(row.sequence_num),
-          row.scheduled_at,
-          queueReason(row)
-        ])}
-      />
+      <div className="queue-list">
+        {filteredQueue.map((row) => {
+          const contact = contactById.get(row.contact_id);
+          const email = row.contact_email ?? contact?.email ?? row.contact_id;
+          const verification = verificationLookup.byContactId.get(row.contact_id) ?? verificationLookup.byEmail.get(email.toLowerCase());
+          const failedTrace = (row.policy_trace ?? []).filter((gate) => !gate.passed);
+          const deliverabilityGate = failedTrace.find((gate) => deliverabilityGateNames.has(gate.gate));
+          const failedTraceLabels = failedTrace.map((gate) => {
+            const details = formatPolicyDetails(gate.details);
+            return `${formatBlockReason(gate.reason_code)}${details ? ` (${details})` : ""}`;
+          });
+          const blockExplanation = row.classification_note || (failedTrace.length
+            ? failedTraceLabels.join("; ")
+            : row.policy_block_reasons.map(formatBlockReason).join("; ") || "none");
+          const attempt = row.latest_attempt;
+          const sendNowEligible = ["pending", "skipped", "simulated", "failed", "blocked", "cancelled"].includes(row.status) && (!attempt || attempt.provider_contacted === false) && attempt?.provider_accepted !== true;
+          const retryable = ["failed", "blocked"].includes(row.status) && (!attempt || attempt.provider_contacted === false) && attempt?.provider_accepted !== true;
+          const reconcilable = row.status === "reconciliation_required";
+          const cancellable = ["pending", "skipped", "simulated", "blocked", "failed"].includes(row.status);
+          const acceptanceEvidence = hasQueueAcceptanceEvidence(attempt);
+          const canCancelReconciliation = reconcilable && !acceptanceEvidence;
+          const isBusy = rowAction.isPending && pendingAction.startsWith(`${row.id}:`);
+          const runAction = (action: "send_now" | "retry" | "cancel" | "remove" | "cancel_uncertain" | "finalize_provider_accepted") => {
+            const requiresConfirmation = action !== "retry";
+            const confirmed = !requiresConfirmation || window.confirm(
+              action === "remove"
+                ? "Remove this cancellable item from active Queue work? Its record will be retained as cancelled."
+              : action === "cancel" || action === "cancel_uncertain"
+                ? "Cancel this queue item? Finimatic will not retry it."
+                : action === "send_now"
+                  ? "Reevaluate current policy and send this queue item now if it passes?"
+                : "Finalize this item as provider accepted using the persisted provider evidence?"
+            );
+            if (confirmed) rowAction.mutate({ queueId: row.id, action });
+          };
+          return (
+            <article className="queue-card" key={row.id}>
+              <div className="queue-card-head">
+                <div>
+                  <StatusPill value={row.status} />
+                  {row.stored_status && row.stored_status !== row.status && <small>stored: {row.stored_status}</small>}
+                </div>
+                <div className="queue-card-title">
+                  <strong>{email}</strong>
+                  <span>{row.draft_subject ?? draftById.get(row.draft_id)?.subject ?? row.draft_id}</span>
+                </div>
+                <div className="queue-card-meta">
+                  <span>Sequence <strong>{row.sequence_num}</strong></span>
+                  <span>Scheduled <strong>{new Date(row.scheduled_at).toLocaleString()}</strong></span>
+                  <span>Schedule source <strong>{row.schedule_source ?? "unknown"}</strong></span>
+                  <span>Verification <strong>{verification?.status ?? "unknown"}</strong></span>
+                </div>
+              </div>
+              <div className="queue-truth-grid">
+                <span>Attempt status<strong>{attempt?.attempt_status ?? "not attempted"}</strong></span>
+                <span>Attempt ID<strong>{attempt?.attempt_id ?? "none"}</strong></span>
+                <span>Transport<strong>{attempt ? `${attempt.configured_transport} -> ${attempt.effective_transport}` : "not selected"}</strong></span>
+                <span>Source<strong>{attempt?.transport_source ?? "none"}</strong></span>
+                <span>Simulated<strong>{attempt ? (attempt.simulated ? "yes" : "no") : "unknown"}</strong></span>
+                <span>Provider contacted<strong>{attempt ? (attempt.provider_contacted ? "yes" : "no") : "unknown"}</strong></span>
+                <span>Provider accepted<strong>{attempt ? (attempt.provider_accepted ? "yes" : "no") : "unknown"}</strong></span>
+                <span>Provider message ID<strong>{attempt?.provider_message_id ?? "none"}</strong></span>
+                <span>Provider response<strong>{attempt?.provider_response_classification ?? "none"}</strong></span>
+                <span>Idempotency key<strong>{attempt?.idempotency_key ?? "none"}</strong></span>
+              </div>
+              <div className="queue-card-detail">
+                <span>Deliverability gate<strong>{deliverabilityGate ? `${formatGateName(deliverabilityGate.gate)}: ${formatBlockReason(deliverabilityGate.reason_code)}` : "pass"}</strong></span>
+                <span>Reason<strong>{blockExplanation || queueReason(row)}</strong></span>
+                {attempt?.error_code && <span>Error<strong>{attempt.error_code}: {attempt.error_detail_redacted ?? "no additional detail"}</strong></span>}
+              </div>
+              <div className="queue-actions">
+                <button className="button primary compact" disabled={!sendNowEligible || rowAction.isPending || process.isPending} onClick={() => runAction("send_now")}>
+                  <Send className={isBusy && pendingAction.endsWith(":send_now") ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Reevaluate & Send Now
+                </button>
+                <button className="button secondary compact" disabled={!retryable || rowAction.isPending || process.isPending} onClick={() => runAction("retry")}>
+                  <RotateCcw className={isBusy && pendingAction.endsWith(":retry") ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Retry
+                </button>
+                <button
+                  className="button danger compact"
+                  disabled={(!cancellable && !canCancelReconciliation) || rowAction.isPending || process.isPending}
+                  onClick={() => runAction(reconcilable ? "cancel_uncertain" : "cancel")}
+                >
+                  <X className="h-4 w-4" /> {reconcilable ? "Cancel uncertain" : "Cancel"}
+                </button>
+                <button
+                  className="button secondary compact"
+                  disabled={!cancellable || rowAction.isPending || process.isPending || clear.isPending}
+                  onClick={() => runAction("remove")}
+                >
+                  <Trash2 className="h-4 w-4" /> Remove from Queue
+                </button>
+                <button
+                  className="button primary compact"
+                  disabled={!reconcilable || !acceptanceEvidence || rowAction.isPending || process.isPending}
+                  title={acceptanceEvidence ? "Finalize persisted provider acceptance" : "Persisted provider acceptance evidence is incomplete"}
+                  onClick={() => runAction("finalize_provider_accepted")}
+                >
+                  <Check className="h-4 w-4" /> Finalize accepted
+                </button>
+              </div>
+            </article>
+          );
+        })}
+      </div>
     </Panel>
   );
 }
@@ -1668,28 +2928,6 @@ function RepliesPanel({ contacts, replies }: { contacts: Contact[]; replies: Rep
       await refreshReplyViews(queryClient, replyViewContactId);
     }
   });
-  useEffect(() => {
-    let cancelled = false;
-    let inFlight = false;
-    async function fetchLatestReplies() {
-      if (inFlight) return;
-      inFlight = true;
-      try {
-        await api.fetchReplies();
-        if (!cancelled) await refreshReplyViews(queryClient, replyViewContactId);
-      } catch {
-        // Keep background reply checks quiet; the button still reports failures.
-      } finally {
-        inFlight = false;
-      }
-    }
-    void fetchLatestReplies();
-    const timer = window.setInterval(fetchLatestReplies, 10000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [queryClient, replyViewContactId]);
   const add = useMutation({
     mutationFn: () => api.addReply({ contact_id: contactId, classified_as: classifiedAs, raw_summary: "manual UI mark" }),
     onSuccess: async () => {
@@ -1909,27 +3147,6 @@ function ConversationsPanel({ contacts, summaries, settings, providerHealth }: {
       await refreshReplyViews(queryClient, contactId);
     }
   });
-  useEffect(() => {
-    if (!contactId) return;
-    let cancelled = false;
-    let inFlight = false;
-    const timer = window.setInterval(async () => {
-      if (inFlight) return;
-      inFlight = true;
-      try {
-        await api.fetchReplies();
-        if (!cancelled) await refreshReplyViews(queryClient, contactId);
-      } catch {
-        // Manual fetch still surfaces errors through the button; background checks stay quiet.
-      } finally {
-        inFlight = false;
-      }
-    }, 10000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [contactId, queryClient]);
   const generate = useMutation({
     mutationFn: (targetContactId: string) =>
       api.generateConversationReply(targetContactId, {
@@ -1953,19 +3170,53 @@ function ConversationsPanel({ contacts, summaries, settings, providerHealth }: {
   });
   const sendReply = useMutation({
     mutationFn: (payload: { targetContactId: string; subject: string; body: string }) =>
-      api.sendConversationReply(payload.targetContactId, { subject: payload.subject, body: payload.body }),
-    onSuccess: (result, payload) => {
-      toast(result.status === "success" ? "conversation reply sent" : result.status);
+      api.sendConversationReply(payload.targetContactId, {
+        session_token: getSessionToken(),
+        subject: payload.subject,
+        body: payload.body
+      }),
+    onSuccess: () => {
+      toast("conversation reply is waiting for confirmation");
+      void queryClient.invalidateQueries({ queryKey: ["governed-actions"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "send failed"))
+  });
+  const governedActions = useQuery({
+    queryKey: ["governed-actions"],
+    queryFn: () => api.listGovernedActions(getSessionToken())
+  });
+  const pendingConversationAction = governedActions.data?.items.find(
+    (action) => action.capability === "conversation_send_reply" && action.contact_id === contactId
+  );
+  const confirmReply = useMutation({
+    mutationFn: (action: GovernedAction) =>
+      api.confirmConversationReply(contactId, {
+        session_token: getSessionToken(),
+        action_id: action.action_id,
+        subject: action.subject,
+        body: action.body
+      }),
+    onSuccess: (result) => {
+      toast(result.status === "provider_accepted" ? "conversation reply provider accepted" : `conversation reply ${result.status}`);
       setDraftsByContact((current) => ({
         ...current,
-        [payload.targetContactId]: { subject: "", body: "", reasoning: "", instruction: current[payload.targetContactId]?.instruction ?? defaultInstruction }
+        [contactId]: { subject: "", body: "", reasoning: "", instruction: current[contactId]?.instruction ?? defaultInstruction }
       }));
-      void queryClient.invalidateQueries({ queryKey: ["conversation", payload.targetContactId] });
+      void queryClient.invalidateQueries({ queryKey: ["governed-actions"] });
+      void queryClient.invalidateQueries({ queryKey: ["conversation", contactId] });
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["contacts"] });
       void queryClient.invalidateQueries({ queryKey: ["audit"] });
     },
-    onError: (error) => toast(apiErrorMessage(error, "send failed"))
+    onError: (error) => toast(apiErrorMessage(error, "confirmation failed"))
+  });
+  const cancelReply = useMutation({
+    mutationFn: (action: GovernedAction) => api.cancelGovernedAction(action.action_id, getSessionToken()),
+    onSuccess: () => {
+      toast("conversation send cancelled");
+      void queryClient.invalidateQueries({ queryKey: ["governed-actions"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "cancel failed"))
   });
 
   return (
@@ -2067,14 +3318,51 @@ function ConversationsPanel({ contacts, summaries, settings, providerHealth }: {
               <button className="button secondary" disabled={!contactId || generate.isPending || messages.length === 0} onClick={() => generate.mutate(contactId)}>
                 <Sparkles className={generate.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Generate Reply
               </button>
-              <button className="button primary" disabled={!contactId || !activeDraft.subject.trim() || !activeDraft.body.trim() || sendReply.isPending} onClick={() => sendReply.mutate({ targetContactId: contactId, subject: activeDraft.subject, body: activeDraft.body })}>
-                <Send className={sendReply.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Send Reply
+              <button className="button primary" disabled={!contactId || !activeDraft.subject.trim() || !activeDraft.body.trim() || sendReply.isPending || Boolean(pendingConversationAction)} onClick={() => sendReply.mutate({ targetContactId: contactId, subject: activeDraft.subject, body: activeDraft.body })}>
+                <Send className={sendReply.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Review Send
               </button>
             </div>
+            {pendingConversationAction && (
+              <GovernedActionCard
+                action={pendingConversationAction}
+                busy={confirmReply.isPending || cancelReply.isPending}
+                onConfirm={() => confirmReply.mutate(pendingConversationAction)}
+                onCancel={() => cancelReply.mutate(pendingConversationAction)}
+              />
+            )}
           </div>
         </div>
       </div>
     </Panel>
+  );
+}
+
+function GovernedActionCard({ action, busy, onConfirm, onCancel }: { action: GovernedAction; busy: boolean; onConfirm: () => void; onCancel: () => void }) {
+  return (
+    <div className="notice warning mt-4" data-action-id={action.action_id}>
+      <strong>Confirmation required</strong>
+      <div>{action.confirmation_prompt}</div>
+      {action.to && <div><strong>Target:</strong> {action.to}</div>}
+      {action.subject && <div><strong>Subject:</strong> {action.subject}</div>}
+      {action.body && <div className="snippet-cell">{action.body.slice(0, 300)}</div>}
+      {action.evidence_summary && <div><strong>Evidence:</strong> {action.evidence_summary}</div>}
+      {action.proposed_side_effect && <div><strong>Effect:</strong> {action.proposed_side_effect}</div>}
+      {action.activation_details && (
+        <div className="mt-3">
+          <div><strong>Mailbox:</strong> {action.activation_details.mailbox || "not configured"}</div>
+          <div><strong>Daily cap:</strong> {action.activation_details.daily_cap ?? "not configured"}</div>
+          <div><strong>Minimum gap:</strong> {action.activation_details.minimum_gap_minutes ?? "not configured"} minutes</div>
+          <div><strong>Allowed intents:</strong> {action.activation_details.safe_intents || "none configured"}</div>
+          <div><strong>Stop conditions:</strong> {action.activation_details.stop_conditions || "none configured"}</div>
+        </div>
+      )}
+      {action.policy_result && <div><strong>Policy:</strong> {action.policy_result}</div>}
+      <div><strong>Expires:</strong> {new Date(action.expires_at).toLocaleString()}</div>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button className="button primary" disabled={busy} onClick={onConfirm}>Confirm</button>
+        <button className="button secondary" disabled={busy} onClick={onCancel}>Cancel</button>
+      </div>
+    </div>
   );
 }
 
@@ -2089,42 +3377,46 @@ function autoReplyModePayload(mode: AutoReplyModeSelection) {
   return mode === "off" ? { auto_reply_enabled: false } : { auto_reply_enabled: true, auto_reply_mode: mode };
 }
 
-function applyAutoReplyMode(settings: SettingsRead, mode: AutoReplyModeSelection): SettingsRead {
-  return {
-    ...settings,
-    auto_reply_enabled: mode !== "off",
-    auto_reply_mode: mode === "off" ? settings.auto_reply_mode : mode
-  };
-}
-
 function AutoReplyPanel({ pending, log, navigate, settings }: { pending: AutoReplyPending[]; log: AuditEvent[]; navigate: (surface: Surface) => void; settings?: SettingsRead }) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<"pending" | "log">("pending");
   const [logFilter, setLogFilter] = useState("");
   const savedMode = autoReplyModeSelection(settings);
   const [selectedMode, setSelectedMode] = useState<AutoReplyModeSelection>(savedMode);
+  const governedActions = useQuery({
+    queryKey: ["governed-actions"],
+    queryFn: () => api.listGovernedActions(getSessionToken())
+  });
+  const autonomousAction = governedActions.data?.items.find((action) => action.capability === "auto_reply_enable_autonomous");
   const updateMode = useMutation({
-    mutationFn: (mode: AutoReplyModeSelection) => api.updateSettings(autoReplyModePayload(mode)),
+    mutationFn: async (mode: AutoReplyModeSelection) => {
+      if (mode === "off") {
+        await api.killAutoReply();
+        return { mode, settings: await api.getSettings() };
+      }
+      if (mode === "autonomous") {
+        const pendingAction = await api.prepareAutonomousAutoReply(getSessionToken());
+        return { mode, pendingAction };
+      }
+      return { mode, settings: await api.updateSettings(autoReplyModePayload(mode)) };
+    },
     onMutate: (mode) => {
       setSelectedMode(mode);
-      const previous = queryClient.getQueryData<SettingsRead>(["settings"]);
-      if (previous) {
-        queryClient.setQueryData(["settings"], applyAutoReplyMode(previous, mode));
-      }
-      return { previous };
     },
-    onSuccess: (next) => {
-      queryClient.setQueryData(["settings"], next);
-      setSelectedMode(autoReplyModeSelection(next));
-      toast(!next.auto_reply_enabled ? "auto-reply turned off" : next.auto_reply_mode === "autonomous" ? "autonomous auto-reply enabled" : "approval mode enabled");
-    },
-    onError: (error, _mode, context) => {
-      if (context?.previous) {
-        queryClient.setQueryData(["settings"], context.previous);
-        setSelectedMode(autoReplyModeSelection(context.previous));
-      } else {
-        setSelectedMode(savedMode);
+    onSuccess: (result) => {
+      if (result.pendingAction) {
+        toast("autonomous activation is waiting for confirmation");
+        void queryClient.invalidateQueries({ queryKey: ["governed-actions"] });
+        return;
       }
+      if (result.settings) {
+        queryClient.setQueryData(["settings"], result.settings);
+        setSelectedMode(autoReplyModeSelection(result.settings));
+        toast(result.mode === "off" ? "auto-reply stopped" : "approval mode enabled");
+      }
+    },
+    onError: (error) => {
+      setSelectedMode(savedMode);
       toast(apiErrorMessage(error, "auto-reply mode update failed"));
     },
     onSettled: () => {
@@ -2134,8 +3426,8 @@ function AutoReplyPanel({ pending, log, navigate, settings }: { pending: AutoRep
     }
   });
   useEffect(() => {
-    if (!updateMode.isPending) setSelectedMode(savedMode);
-  }, [savedMode, updateMode.isPending]);
+    if (!updateMode.isPending && !autonomousAction) setSelectedMode(savedMode);
+  }, [autonomousAction, savedMode, updateMode.isPending]);
   const modeCopy = selectedMode === "autonomous" ? "Autonomous send" : selectedMode === "propose" ? "Approval required" : "Off";
   const modeButtonClass = (mode: AutoReplyModeSelection) =>
     [selectedMode === mode ? "active" : "", updateMode.isPending && selectedMode === mode ? "saving" : ""].filter(Boolean).join(" ");
@@ -2148,38 +3440,41 @@ function AutoReplyPanel({ pending, log, navigate, settings }: { pending: AutoRep
     },
     onError: (error) => toast(apiErrorMessage(error, "fetch failed"))
   });
-  useEffect(() => {
-    let cancelled = false;
-    let inFlight = false;
-    async function fetchLatestReplies() {
-      if (inFlight) return;
-      inFlight = true;
-      try {
-        await api.fetchReplies();
-        if (!cancelled) await refreshReplyViews(queryClient);
-      } catch {
-        // Background checks stay quiet; the explicit button surfaces fetch errors.
-      } finally {
-        inFlight = false;
-      }
-    }
-    void fetchLatestReplies();
-    const timer = window.setInterval(fetchLatestReplies, 10000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [queryClient]);
   const approve = useMutation({
-    mutationFn: api.approveAutoReply,
+    mutationFn: (draftId: string) => api.approveAutoReply(draftId, getSessionToken()),
     onSuccess: () => {
-      toast("reply sent");
+      toast("Auto-Reply is waiting for confirmation");
+      void queryClient.invalidateQueries({ queryKey: ["governed-actions"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "approve failed"))
+  });
+  const confirmAction = useMutation({
+    mutationFn: async (action: GovernedAction) => {
+      if (action.capability === "auto_reply_enable_autonomous") {
+        return api.confirmAutonomousAutoReply(action.action_id, getSessionToken());
+      }
+      if (!action.draft_id) throw new Error("draft_id_missing");
+      return api.confirmAutoReply(action.draft_id, action.action_id, getSessionToken());
+    },
+    onSuccess: (result) => {
+      toast(result.status === "provider_accepted" ? "reply provider accepted" : result.status.replace(/_/g, " "));
+      void queryClient.invalidateQueries({ queryKey: ["settings"] });
+      void queryClient.invalidateQueries({ queryKey: ["governed-actions"] });
       void queryClient.invalidateQueries({ queryKey: ["auto-reply-pending"] });
       void queryClient.invalidateQueries({ queryKey: ["auto-reply-log"] });
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["audit"] });
     },
-    onError: (error) => toast(apiErrorMessage(error, "approve failed"))
+    onError: (error) => toast(apiErrorMessage(error, "confirmation failed"))
+  });
+  const cancelAction = useMutation({
+    mutationFn: (action: GovernedAction) => api.cancelGovernedAction(action.action_id, getSessionToken()),
+    onSuccess: () => {
+      toast("pending action cancelled");
+      setSelectedMode(savedMode);
+      void queryClient.invalidateQueries({ queryKey: ["governed-actions"] });
+    },
+    onError: (error) => toast(apiErrorMessage(error, "cancel failed"))
   });
   const reject = useMutation({
     mutationFn: api.rejectAutoReply,
@@ -2220,7 +3515,7 @@ function AutoReplyPanel({ pending, log, navigate, settings }: { pending: AutoRep
             aria-pressed={selectedMode === "off"}
             onClick={() => updateMode.mutate("off")}
           >
-            <PauseCircle className="h-4 w-4" /> Off
+            <PauseCircle className="h-4 w-4" /> Stop Now
           </button>
           <button
             className={modeButtonClass("propose")}
@@ -2240,6 +3535,19 @@ function AutoReplyPanel({ pending, log, navigate, settings }: { pending: AutoRep
           </button>
         </div>
       </div>
+      {autonomousAction && (
+        <GovernedActionCard
+          action={autonomousAction}
+          busy={confirmAction.isPending || cancelAction.isPending}
+          onConfirm={() => confirmAction.mutate(autonomousAction)}
+          onCancel={() => cancelAction.mutate(autonomousAction)}
+        />
+      )}
+      {(selectedMode === "autonomous" || autonomousAction) && (
+        <div className="notice warning mt-4">
+          Autonomous sends remain subject to the kill switch, reply and suppression stops, caps, allowed intents, transport checks, and final provider-boundary policy validation.
+        </div>
+      )}
       <div className="segmented">
         <button className={tab === "pending" ? "active" : ""} onClick={() => setTab("pending")}>Pending Approval</button>
         <button className={tab === "log" ? "active" : ""} onClick={() => setTab("log")}>Activity Log</button>
@@ -2254,21 +3562,40 @@ function AutoReplyPanel({ pending, log, navigate, settings }: { pending: AutoRep
                 <tr><th>Contact</th><th>Their Reply</th><th>AI Reply</th><th>Generated</th><th>Actions</th></tr>
               </thead>
               <tbody>
-                {pending.map((row) => (
-                  <tr key={row.id}>
-                    <td><strong>{row.contact_name || row.contact_email}</strong><div className="reply-date">{row.contact_email}</div></td>
-                    <td className="snippet-cell">{row.their_reply}</td>
-                    <td className="snippet-cell"><strong>{row.subject}</strong><br />{row.body.slice(0, 200)}</td>
-                    <td>{row.generated_at ? new Date(row.generated_at).toLocaleString() : ""}</td>
-                    <td>
-                      <div className="reply-actions">
-                        <button className="button primary" disabled={approve.isPending} onClick={() => approve.mutate(row.id)}>Approve</button>
-                        <button className="button secondary" onClick={() => editDraft(row)}>Edit</button>
-                        <button className="button danger" disabled={reject.isPending} onClick={() => reject.mutate(row.id)}>Reject</button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
+                {pending.map((row) => {
+                  const pendingApproval = governedActions.data?.items.find(
+                    (action) => action.capability === "auto_reply_approve" && action.draft_id === row.id
+                  );
+                  return (
+                    <Fragment key={row.id}>
+                      <tr data-draft-id={row.id}>
+                        <td><strong>{row.contact_name || row.contact_email}</strong><div className="reply-date">{row.contact_email}</div></td>
+                        <td className="snippet-cell">{row.their_reply}</td>
+                        <td className="snippet-cell"><strong>{row.subject}</strong><br />{row.body.slice(0, 200)}</td>
+                        <td>{row.generated_at ? new Date(row.generated_at).toLocaleString() : ""}</td>
+                        <td>
+                          <div className="reply-actions">
+                            <button className="button primary" disabled={approve.isPending || Boolean(pendingApproval)} onClick={() => approve.mutate(row.id)}>Review Approval</button>
+                            <button className="button secondary" onClick={() => editDraft(row)}>Edit</button>
+                            <button className="button danger" disabled={reject.isPending} onClick={() => reject.mutate(row.id)}>Reject</button>
+                          </div>
+                        </td>
+                      </tr>
+                      {pendingApproval && (
+                        <tr>
+                          <td colSpan={5}>
+                            <GovernedActionCard
+                              action={pendingApproval}
+                              busy={confirmAction.isPending || cancelAction.isPending}
+                              onConfirm={() => confirmAction.mutate(pendingApproval)}
+                              onCancel={() => cancelAction.mutate(pendingApproval)}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -2340,13 +3667,21 @@ function AuditPanel({ audit }: { audit: AuditEvent[] }) {
     row.created_at,
     row.event_label ?? humanizeAuditEvent(row.event_type),
     auditWho(row),
-    row.detail ?? auditFallbackDetail(row)
+    row.detail ?? auditFallbackDetail(row),
+    auditTransportTruth(row)
   ]);
   return (
     <Panel title="Audit Logs" icon={Database}>
-      <DataTable columns={["time", "what happened", "who", "details"]} rows={rows} />
+      <DataTable columns={["time", "what happened", "who", "details", "transport truth"]} rows={rows} />
     </Panel>
   );
+}
+
+function auditTransportTruth(row: AuditEvent): string {
+  return ["attempt_status", "effective_transport", "simulated", "provider_contacted", "provider_accepted", "attempt_id"]
+    .filter((key) => key in row.payload)
+    .map((key) => `${key}=${String(row.payload[key])}`)
+    .join(" | ") || "n/a";
 }
 
 function auditWho(row: AuditEvent): string {
@@ -2373,15 +3708,16 @@ function ErrorsPanel({ audit }: { audit: AuditEvent[] }) {
   const errors = audit.filter((row) => row.event_type.includes("failed") || row.event_type.includes("blocked") || row.event_type.includes("exhausted"));
   return (
     <Panel title="Errors" icon={AlertTriangle}>
+      <div className="notice compact">This view is an audit-event filter, not a complete independent error store.</div>
       <DataTable columns={["time", "event", "payload"]} rows={errors.map((row) => [row.created_at, row.event_type, JSON.stringify(row.payload)])} />
     </Panel>
   );
 }
 
-function SettingsPanel({ settings }: { settings?: SettingsRead }) {
+function SettingsPanel({ settings, ready }: { settings?: SettingsRead; ready: boolean }) {
   const queryClient = useQueryClient();
   const [gmailUser, setGmailUser] = useState(settings?.gmail_user ?? "");
-  const [emailTransport, setEmailTransport] = useState<"smtp" | "gmail_api">(settings?.email_transport ?? "smtp");
+  const [emailTransport, setEmailTransport] = useState<"smtp" | "gmail_api">(settings?.email_transport ?? "gmail_api");
   const [password, setPassword] = useState("");
   const [gmailApiClientId, setGmailApiClientId] = useState("");
   const [gmailApiClientSecret, setGmailApiClientSecret] = useState("");
@@ -2392,7 +3728,7 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
   const [dailyCap, setDailyCap] = useState(settings?.daily_send_cap ?? 50);
   const [hourlyCap, setHourlyCap] = useState(settings?.hourly_send_cap ?? 10);
   const [delay, setDelay] = useState(settings?.send_delay_s ?? 60);
-  const [autoProcessEnabled, setAutoProcessEnabled] = useState(settings?.auto_process_enabled ?? true);
+  const [autoProcessEnabled, setAutoProcessEnabled] = useState(settings?.auto_process_enabled ?? false);
   const [autoProcessQueueInterval, setAutoProcessQueueInterval] = useState(settings?.auto_process_queue_interval_seconds ?? 5);
   const [autoProcessFollowupInterval, setAutoProcessFollowupInterval] = useState(settings?.auto_process_followup_interval_seconds ?? 60);
   const [followupDays, setFollowupDays] = useState(settings?.followup_interval_days ?? 3);
@@ -2422,12 +3758,12 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
   useEffect(() => {
     if (!settings) return;
     setGmailUser(settings.gmail_user);
-    setEmailTransport(settings.email_transport ?? "smtp");
+    setEmailTransport(settings.email_transport ?? "gmail_api");
     setRecipient(settings.report_recipient);
     setDailyCap(settings.daily_send_cap);
     setHourlyCap(settings.hourly_send_cap);
     setDelay(settings.send_delay_s);
-    setAutoProcessEnabled(settings.auto_process_enabled ?? true);
+    setAutoProcessEnabled(settings.auto_process_enabled ?? false);
     setAutoProcessQueueInterval(settings.auto_process_queue_interval_seconds ?? 5);
     setAutoProcessFollowupInterval(settings.auto_process_followup_interval_seconds ?? 60);
     setFollowupDays(settings.followup_interval_days);
@@ -2554,23 +3890,37 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
       action={
         <div className="flex gap-2">
           {emailTransport === "gmail_api" && (
-            <button className={`button secondary${connectGmailApi.isPending ? " is-loading" : ""}`} disabled={saveVerify.isPending || save.isPending || connectGmailApi.isPending} aria-busy={connectGmailApi.isPending} onClick={() => connectGmailApi.mutate()}>
+            <button className={`button secondary${connectGmailApi.isPending ? " is-loading" : ""}`} disabled={!ready || saveVerify.isPending || save.isPending || connectGmailApi.isPending} aria-busy={connectGmailApi.isPending} onClick={() => connectGmailApi.mutate()}>
               <KeyRound className={connectGmailApi.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{connectGmailApi.isPending ? "Connecting..." : "Connect Gmail API"}</span>
             </button>
           )}
-          <button className={`button secondary${saveVerify.isPending ? " is-loading" : ""}`} disabled={saveVerify.isPending || save.isPending || connectGmailApi.isPending} aria-busy={saveVerify.isPending} onClick={() => saveVerify.mutate()}>
+          <button className={`button secondary${saveVerify.isPending ? " is-loading" : ""}`} disabled={!ready || saveVerify.isPending || save.isPending || connectGmailApi.isPending} aria-busy={saveVerify.isPending} onClick={() => saveVerify.mutate()}>
             <Check className={saveVerify.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{saveVerify.isPending ? "Verifying..." : "Save & Verify Email"}</span>
           </button>
-          <button className={`button primary${save.isPending ? " is-loading" : ""}`} disabled={save.isPending || saveVerify.isPending || connectGmailApi.isPending} onClick={() => save.mutate()}>
+          <button className={`button primary${save.isPending ? " is-loading" : ""}`} disabled={!ready || save.isPending || saveVerify.isPending || connectGmailApi.isPending} onClick={() => save.mutate()}>
             <KeyRound className={save.isPending ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> <span>{save.isPending ? "Saving..." : "Save"}</span>
           </button>
         </div>
       }
     >
+      <TransportTruth settings={settings} compact />
+      {settings?.release_blocked && <div className="notice mt-4"><strong>Release blocker:</strong> operational APIs have an injectable authorization boundary, but production identity enforcement is not configured.</div>}
+      {!settings?.auto_process_effective && (
+        <div className="notice warning mt-4">
+          <strong>Automatic queue processing is not running.</strong>
+          <div>Configured: {settings?.auto_process_enabled ? "on" : "off"}; runtime: {settings?.auto_process_block_reason?.split("_").join(" ") ?? "paused"}.</div>
+        </div>
+      )}
+      {settings?.hosting_mode === "render_free" && (
+        <div className="notice warning mt-4">
+          <strong>Render Free automation is best effort.</strong>
+          <div>Manual Approve &amp; Send works synchronously after the service wakes. Scheduled Queue and Auto-Reply work can be delayed while Render sleeps and is not guaranteed to run continuously.</div>
+        </div>
+      )}
       <div className="form-grid">
         <label>Gmail User<input value={gmailUser} onChange={(e) => setGmailUser(e.target.value)} /></label>
-        <label>Email Transport<select value={emailTransport} onChange={(e) => setEmailTransport(e.target.value as "smtp" | "gmail_api")}><option value="smtp">Gmail SMTP</option><option value="gmail_api">Gmail API</option></select></label>
-        <label>Gmail App Password (SMTP/IMAP)<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={settings?.gmail_app_password_configured ? "configured" : ""} /></label>
+        <label>Email Transport<select value={emailTransport} onChange={(e) => setEmailTransport(e.target.value as "smtp" | "gmail_api")}><option value="smtp" disabled={settings?.smtp_available === false}>Gmail SMTP{settings?.smtp_available === false ? " (local only)" : ""}</option><option value="gmail_api">Gmail API</option></select></label>
+        <label>Gmail App Password (SMTP/IMAP)<input type="password" disabled={settings?.smtp_available === false} value={password} onChange={(e) => setPassword(e.target.value)} placeholder={settings?.gmail_app_password_configured ? "configured" : ""} /></label>
         <label>Report Recipient<input value={recipient} onChange={(e) => setRecipient(e.target.value)} /></label>
         {emailTransport === "gmail_api" && (
           <>
@@ -2610,12 +3960,12 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
             <label className="toggle"><input type="checkbox" checked={autoReplyEnabled} onChange={(e) => setAutoReplyEnabled(e.target.checked)} /> Enable Auto-Reply System</label>
           </div>
           <div className="form-grid mt-4">
-            <label>Reply Mode<select value={autoReplyMode} disabled={!autoReplyEnabled} onChange={(e) => setAutoReplyMode(e.target.value as "propose" | "autonomous")}><option value="propose">Propose (one-click approve)</option><option value="autonomous">Autonomous (send immediately)</option></select></label>
+            <label>Reply Mode<select value={autoReplyMode} disabled={!autoReplyEnabled || autoReplyMode === "autonomous"} onChange={(e) => setAutoReplyMode(e.target.value as "propose" | "autonomous")}><option value="propose">Propose (confirmation required)</option><option value="autonomous" disabled>Autonomous (enable from Auto-Reply panel)</option></select></label>
             <label>Auto-Reply Daily Cap<input type="number" min={0} disabled={!autoReplyEnabled} value={autoReplyDailyCap} onChange={(e) => setAutoReplyDailyCap(Number(e.target.value))} /></label>
             <label>Minimum Gap Between Replies (minutes)<input type="number" min={0} disabled={!autoReplyEnabled} value={autoReplyMinGap} onChange={(e) => setAutoReplyMinGap(Number(e.target.value))} /></label>
           </div>
           {autoReplyMode === "autonomous" && autoReplyEnabled && (
-            <div className="notice warning">In Autonomous mode, replies will be sent without your review. Ensure your provider keys and sender profile are accurate before enabling this.</div>
+            <div className="notice warning">Autonomous mode was governed-confirmed in the Auto-Reply panel. Use Stop Now there to disable provider execution immediately.</div>
           )}
           <div className="mt-4">
             <div className="text-sm font-semibold text-muted">Safe Intents</div>
@@ -2638,8 +3988,8 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
         />
       </label>
       <div className="mt-4 grid gap-3 lg:grid-cols-2">
-        <label>Groq Keys<textarea value={groq} onChange={(e) => setGroq(e.target.value)} rows={4} /></label>
-        <label>Gemini Keys<textarea value={gemini} onChange={(e) => setGemini(e.target.value)} rows={4} /></label>
+        <label>Groq Keys (comma-separated)<input type="password" autoComplete="new-password" value={groq} onChange={(e) => setGroq(e.target.value)} /></label>
+        <label>Gemini Keys (comma-separated)<input type="password" autoComplete="new-password" value={gemini} onChange={(e) => setGemini(e.target.value)} /></label>
       </div>
       <div className="settings-section">
         <h3>AI Model Configuration</h3>
@@ -2665,7 +4015,7 @@ function SettingsPanel({ settings }: { settings?: SettingsRead }) {
         </div>
       </div>
       <div className="mt-4 flex flex-wrap gap-4">
-        <label className="toggle"><input type="checkbox" checked={autoProcessEnabled} onChange={(e) => setAutoProcessEnabled(e.target.checked)} /> Auto Process Queue</label>
+        <label className="toggle"><input type="checkbox" checked={autoProcessEnabled} onChange={(e) => setAutoProcessEnabled(e.target.checked)} /> Best-effort automation</label>
         <label className="toggle"><input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} /> Dry run</label>
         <label className="toggle"><input type="checkbox" checked={warmUpMode} onChange={(e) => setWarmUpMode(e.target.checked)} /> Warm-up Mode</label>
         {warmUpMode && <span className="fingerprint">Ramp limit: {settings?.warm_up_current_limit ?? dailyCap}/day</span>}

@@ -31,6 +31,8 @@ build/
 .netlify/
 .codex_tmp/
 KEYS.md
+Gmail auth.md
+GMAIL_AUTH.md
 NUL
 
 # Local verification artifacts. Keep curated public screenshots in docs/assets/screenshots/.

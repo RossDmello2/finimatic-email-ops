@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 import time
@@ -24,7 +23,17 @@ from app.conversations.router import ConversationGenerate, _generate_next_reply
 from app.core.idempotency import sha256_key
 from app.core.time import iso, utcnow
 from app.db.models import AgentSession, Contact, ConversationMessage, Draft, FollowUpSequence, PendingEmailActionRow, Reply, SendAttempt, SendQueue, Suppression
-from app.send.smtp_adapter import GmailAdapter
+from app.deliverability.service import deliverability_policy
+from app.send.governance import (
+    begin_provider_attempt,
+    persist_provider_outcome,
+    persist_provider_outcome_as_reconciliation,
+    provider_attempt_stop_fence_changed,
+)
+from app.send.policy import prequeue_block_reasons
+from app.send.outcomes import simulated_outcome
+from app.send.smtp_adapter import GmailAdapter, resolve_transport_metadata
+from app.send.truth import attempt_from_outcome, outcome_audit_payload
 from app.settings.service import get_bool, get_effective_daily_send_cap, get_int, get_key_list, get_secret, get_value, sender_credentials_configured
 
 GMAIL_APP_SECRET_KEY = "gmail_" + "app_" + "password"
@@ -390,7 +399,7 @@ class AgenticToolExecutor:
         two_hours = now - timedelta(hours=2)
         pending_count = db.query(SendQueue).filter(SendQueue.status == "pending").count()
         blocked_count = db.query(SendQueue).filter(SendQueue.status == "blocked").count()
-        sent_today = db.query(SendAttempt).filter(SendAttempt.status == "success", SendAttempt.sent_at >= one_day).count()
+        sent_today = db.query(SendAttempt).filter(SendAttempt.provider_accepted.is_(True), SendAttempt.sent_at >= one_day).count()
         autonomous_replies_last_2_hours = (
             db.query(ConversationMessage)
             .filter(
@@ -540,10 +549,13 @@ class AgenticToolExecutor:
         )
 
     def _update_draft(self, params: dict[str, Any], db: Session) -> EvidenceEnvelope:
+        from app.drafts.service import invalidate_draft_approval
+
         draft = db.get(Draft, str(params["pending_draft_id"]))
         if not draft:
             return _envelope("email_update_draft", "empty", {"message": "Draft not found."}, error_code="draft_not_found")
         instruction = sanitize_text(str(params["instruction"]), limit=500)
+        invalidate_draft_approval(db, draft)
         draft.body = f"{draft.body}\n\nRevision note: {instruction}"
         db.flush()
         emit_event(db, "draft.edited", entity_type="draft", entity_id=draft.id, payload={"source": "agent"})
@@ -565,16 +577,69 @@ class AgenticToolExecutor:
         contact = db.get(Contact, action.contact_id) if action else None
         if not draft or not contact:
             return _envelope("email_send_draft", "denied", {"message": "The draft or contact no longer exists."}, error_code="draft_mismatch")
+        status = claim_pending_action(action_id, session.id, draft_id, db)
+        if status != "valid":
+            emit_event(db, "agent.confirmation_invalid", entity_type="pending_email_action", entity_id=action_id, payload={"status": status})
+            return _envelope("email_send_draft", "denied", {"message": "That confirmation is no longer valid.", "status": status}, error_code=status)
+        emit_event(db, "agent.confirmation_valid", entity_type="pending_email_action", entity_id=action_id, payload={"draft_id": draft.id})
+        db.flush()
         block_reasons = _engaged_send_block_reasons(db, contact)
         if block_reasons:
+            idempotency_key = sha256_key(
+                "agent",
+                draft.id,
+                contact.id,
+                draft.subject,
+                draft.body,
+            )
+            if "DRY_RUN_ENABLED" in block_reasons:
+                outcome = simulated_outcome(
+                    resolve_transport_metadata(db),
+                    error_code="dry_run",
+                    detail="Dry-run mode simulated the Assistant send; no provider was contacted",
+                ).with_context(idempotency_key=idempotency_key)
+                attempt = attempt_from_outcome(
+                    outcome,
+                    queue_id="agent",
+                    contact_id=contact.id,
+                    draft_id=draft.id,
+                    idempotency_key=idempotency_key,
+                    sender_identity=get_value(db, "gmail_user"),
+                )
+                db.add(attempt)
+                db.flush()
+                outcome = outcome.with_context(attempt_id=attempt.id)
+                emit_event(
+                    db,
+                    "send.simulated",
+                    entity_type="draft",
+                    entity_id=draft.id,
+                    payload={"source": "agent", "reasons": block_reasons, **outcome_audit_payload(outcome)},
+                )
+                emit_event(
+                    db,
+                    "agent.send_failed",
+                    entity_type="draft",
+                    entity_id=draft.id,
+                    payload=outcome_audit_payload(outcome),
+                )
+                return _envelope(
+                    "email_send_draft",
+                    "denied",
+                    outcome.to_dict(),
+                    error_code="dry_run",
+                )
             db.add(
                 SendAttempt(
                     queue_id="agent",
                     contact_id=contact.id,
                     draft_id=draft.id,
-                    idempotency_key=sha256_key("agent", action_id, draft.id),
-                    status="failed",
+                    idempotency_key=idempotency_key,
+                    status="blocked",
                     sender_identity=get_value(db, "gmail_user"),
+                    simulated=False,
+                    provider_contacted=False,
+                    provider_accepted=False,
                     error_code=block_reasons[0],
                     error_detail="Agent send blocked by policy",
                 )
@@ -582,64 +647,180 @@ class AgenticToolExecutor:
             emit_event(db, "send.failed", entity_type="draft", entity_id=draft.id, payload={"source": "agent", "reasons": block_reasons})
             emit_event(db, "agent.send_failed", entity_type="draft", entity_id=draft.id, payload={"reasons": block_reasons})
             return _envelope("email_send_draft", "denied", {"message": "Send blocked by policy.", "reasons": block_reasons}, error_code=block_reasons[0])
-        status = claim_pending_action(action_id, session.id, draft_id, db)
-        if status != "valid":
-            emit_event(db, "agent.confirmation_invalid", entity_type="pending_email_action", entity_id=action_id, payload={"status": status})
-            return _envelope("email_send_draft", "denied", {"message": "That confirmation is no longer valid.", "status": status}, error_code=status)
-        emit_event(db, "agent.confirmation_valid", entity_type="pending_email_action", entity_id=action_id, payload={"draft_id": draft.id})
-        db.flush()
         user = get_value(db, "gmail_user")
         password = get_secret(db, GMAIL_APP_SECRET_KEY)
         subject = resolve_tokens(draft.subject, contact)
         body = resolve_tokens(draft.body, contact)
 
+        idempotency_key = sha256_key(
+            "agent",
+            draft.id,
+            contact.id,
+            draft.subject,
+            draft.body,
+        )
+        adapter = GmailAdapter.from_settings(db)
+        attempt, attempt_state = begin_provider_attempt(
+            db,
+            queue_id="agent",
+            contact_id=contact.id,
+            draft_id=draft.id,
+            idempotency_key=idempotency_key,
+            sender_identity=user,
+            configured_transport=adapter.resolution.configured_transport,
+            effective_transport=adapter.resolution.effective_transport,
+            transport_source=adapter.resolution.transport_source,
+            entity_type="draft",
+            entity_id=draft.id,
+            audit_source="agent",
+        )
+        if attempt_state == "provider_accepted":
+            return _envelope(
+                "email_send_draft",
+                "denied",
+                {"message": "That send was already provider accepted.", "attempt_id": attempt.id},
+                error_code="consumed",
+            )
+        if attempt_state == "reconciliation_required":
+            return _envelope(
+                "email_send_draft",
+                "denied",
+                {"message": "The prior provider attempt requires reconciliation.", "attempt_id": attempt.id},
+                error_code="reconciliation_required",
+            )
+
+        db.expire_all()
+        draft = db.get(Draft, draft.id)
+        contact = db.get(Contact, contact.id)
+        block_reasons = _engaged_send_block_reasons(db, contact)
+        if provider_attempt_stop_fence_changed(db, attempt.id):
+            block_reasons.append("CONTACT_SEND_STOPPED")
+        if block_reasons:
+            outcome = simulated_outcome(
+                adapter.resolution,
+                error_code="policy_changed_before_provider_call",
+                detail="Policy changed after confirmation; provider execution was blocked",
+                blocked=True,
+            ).with_context(idempotency_key=idempotency_key, attempt_id=attempt.id)
+            persist_provider_outcome(
+                db,
+                attempt_id=attempt.id,
+                outcome=outcome,
+                entity_type="draft",
+                entity_id=draft.id,
+                audit_source="agent",
+            )
+            emit_event(
+                db,
+                "agent.send_failed",
+                entity_type="draft",
+                entity_id=draft.id,
+                payload={"reasons": block_reasons, **outcome_audit_payload(outcome)},
+            )
+            db.commit()
+            return _envelope(
+                "email_send_draft",
+                "denied",
+                outcome.to_dict(),
+                error_code=outcome.error_code,
+            )
+
         sent_at = utcnow()
-        emit_event(db, "send.attempt", entity_type="draft", entity_id=draft.id, payload={"source": "agent"})
-        result = await GmailAdapter.from_settings(db).send_message(contact.email, subject, body, user, password)
-        if result.status != "success":
-            db.add(
-                SendAttempt(
-                    queue_id="agent",
+        outcome = (
+            await adapter.send_message(contact.email, subject, body, user, password)
+        ).with_context(idempotency_key=idempotency_key, attempt_id=attempt.id)
+        db.expire_all()
+        if outcome.provider_accepted and provider_attempt_stop_fence_changed(db, attempt.id):
+            persist_provider_outcome_as_reconciliation(
+                db,
+                attempt_id=attempt.id,
+                outcome=outcome,
+                entity_type="draft",
+                entity_id=draft.id,
+                audit_source="agent",
+                error_code="contact_stopped_after_provider_call",
+                error_detail="Contact send authority changed while the provider call was in flight",
+            )
+            return _envelope(
+                "email_send_draft",
+                "error",
+                {
+                    **outcome.to_dict(),
+                    "status": "reconciliation_required",
+                    "attempt_status": "reconciliation_required",
+                },
+                error_code="contact_stopped_after_provider_call",
+            )
+        def project_agent_send(session_db: Session, _attempt: SendAttempt) -> None:
+            if not outcome.provider_accepted:
+                emit_event(
+                    session_db,
+                    "send.failed",
+                    entity_type="draft",
+                    entity_id=draft.id,
+                    payload={"source": "agent", **outcome_audit_payload(outcome)},
+                )
+                emit_event(
+                    session_db,
+                    "agent.send_failed",
+                    entity_type="draft",
+                    entity_id=draft.id,
+                    payload=outcome_audit_payload(outcome),
+                )
+                return
+            session_db.add(
+                ConversationMessage(
                     contact_id=contact.id,
-                    draft_id=draft.id,
-                    idempotency_key=sha256_key("agent", action_id, draft.id),
-                    status="failed",
-                    sender_identity=user,
-                    error_code=result.error_code,
-                    error_detail=result.error_detail,
+                    direction="outbound",
+                    subject=subject,
+                    body=body,
+                    source="agent",
+                    external_message_id=outcome.provider_message_id or outcome.tracking_message_id,
+                    occurred_at=sent_at,
                 )
             )
-            emit_event(db, "send.failed", entity_type="draft", entity_id=draft.id, payload={"source": "agent", "error_code": result.error_code})
-            emit_event(db, "agent.send_failed", entity_type="draft", entity_id=draft.id, payload={"error_code": result.error_code})
-            return _envelope("email_send_draft", "error", {"status": "failed", "error_code": result.error_code}, error_code=result.error_code)
-        db.add(
-            SendAttempt(
-                queue_id="agent",
-                contact_id=contact.id,
-                draft_id=draft.id,
-                idempotency_key=sha256_key("agent", action_id, draft.id),
-                provider_msg_id=result.provider_msg_id,
-                status="success",
-                sender_identity=user,
-                sent_at=sent_at,
-            )
+            contact.status = "conversation_active"
+            session.pending_action_id = None
+            emit_event(session_db, "agent.send_executed", entity_type="draft", entity_id=draft.id, payload=outcome_audit_payload(outcome))
+            emit_event(session_db, "send.success", entity_type="draft", entity_id=draft.id, payload=outcome_audit_payload(outcome))
+
+        attempt, persisted = persist_provider_outcome(
+            db,
+            attempt_id=attempt.id,
+            outcome=outcome,
+            entity_type="draft",
+            entity_id=draft.id,
+            audit_source="agent",
+            project=project_agent_send,
         )
-        db.add(
-            ConversationMessage(
-                contact_id=contact.id,
-                direction="outbound",
-                subject=subject,
-                body=body,
-                source="agent",
-                external_message_id=result.provider_msg_id,
-                occurred_at=sent_at,
+        if not persisted:
+            return _envelope(
+                "email_send_draft",
+                "error",
+                {
+                    **outcome.to_dict(),
+                    "status": "reconciliation_required",
+                    "attempt_status": "reconciliation_required",
+                },
+                error_code="post_provider_commit_failed",
             )
+        if not outcome.provider_accepted:
+            return _envelope(
+                "email_send_draft",
+                "error",
+                outcome.to_dict(),
+                error_code=outcome.error_code or outcome.attempt_status,
+            )
+        return _envelope(
+            "email_send_draft",
+            "success",
+            {
+                **outcome.to_dict(),
+                "status": "provider_accepted",
+                "sent_at": iso(sent_at),
+                "provider_msg_id": outcome.provider_message_id,
+            },
         )
-        contact.status = "conversation_active"
-        session.pending_action_id = None
-        emit_event(db, "agent.send_executed", entity_type="draft", entity_id=draft.id, payload={"provider_msg_id": result.provider_msg_id})
-        emit_event(db, "send.success", entity_type="draft", entity_id=draft.id)
-        return _envelope("email_send_draft", "success", {"status": "sent", "sent_at": iso(sent_at), "provider_msg_id": result.provider_msg_id})
 
 
 def _explicit_email_draft(instruction: str, sender_signature: str) -> DraftSuggestion | None:
@@ -703,7 +884,7 @@ def _engaged_send_block_reasons(db: Session, contact: Contact) -> list[str]:
     now = utcnow()
     one_day = now - timedelta(days=1)
     one_hour = now - timedelta(hours=1)
-    success_attempts = db.query(SendAttempt).filter(SendAttempt.status == "success")
+    success_attempts = db.query(SendAttempt).filter(SendAttempt.provider_accepted.is_(True))
     sent_today = success_attempts.filter(SendAttempt.sent_at >= one_day).count()
     sent_hour = success_attempts.filter(SendAttempt.sent_at >= one_hour).count()
     reasons: list[str] = []
@@ -733,4 +914,6 @@ def _engaged_send_block_reasons(db: Session, contact: Contact) -> list[str]:
         reasons.append("HOURLY_CAP_EXCEEDED")
     if not send_window_open(db, now):
         reasons.append("SEND_WINDOW_CLOSED")
+    reasons.extend(prequeue_block_reasons(contact, db))
+    reasons.extend(deliverability_policy(db, contact)["reasons"])
     return reasons

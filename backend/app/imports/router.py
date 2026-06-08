@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.imports.service import PreviewExpiredError, commit_import, enrich_imported_contacts, preview_import
+from app.imports.service import PreviewExpiredError, commit_import, preview_import
 
 router = APIRouter(prefix="/api/import", tags=["import"])
 
@@ -30,7 +30,7 @@ def preview(payload: ImportPreviewRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/commit")
-def commit(payload: ImportCommitRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def commit(payload: ImportCommitRequest, db: Session = Depends(get_db)):
     if payload.batch_id_temp:
         try:
             result = commit_import(db, payload.batch_id_temp)
@@ -42,9 +42,7 @@ def commit(payload: ImportCommitRequest, background_tasks: BackgroundTasks, db: 
                     "message": "Import preview expired. Preview the file again before committing.",
                 },
             ) from exc
-        background_tasks.add_task(enrich_imported_contacts, result.get("contact_ids", []))
         return result
     preview = preview_import(db, payload.format, payload.rows, None, payload.filename)
     result = commit_import(db, preview["batch_id_temp"])
-    background_tasks.add_task(enrich_imported_contacts, result.get("contact_ids", []))
     return result

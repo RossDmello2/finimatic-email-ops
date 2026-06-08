@@ -62,7 +62,14 @@ def create_reply(payload: ReplyCreate, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=409, detail="Already marked")
     try:
-        asyncio.run(AutoReplyService().process_reply(contact.id, row.id, db))
+        asyncio.run(
+            AutoReplyService().process_reply(
+                contact.id,
+                row.id,
+                db,
+                allow_autonomous=False,
+            )
+        )
     except Exception as exc:
         emit_event(db, "auto_reply.failed", entity_type="contact", entity_id=contact.id, payload={"reply_id": row.id, "error_code": exc.__class__.__name__})
     db.commit()

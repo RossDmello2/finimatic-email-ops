@@ -65,6 +65,8 @@ def emit_event(
 
 
 EVENT_LABELS = {
+    "auth.login.success": "Operator signed in",
+    "auth.logout": "Operator signed out",
     "settings.updated": "Settings updated",
     "import.preview": "Import checked",
     "import.committed": "Contacts imported",

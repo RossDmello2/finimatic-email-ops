@@ -15,7 +15,7 @@ def build_context_card(db: Session) -> str:
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     last_24h = now - timedelta(hours=24)
 
-    sent_today = db.query(SendAttempt).filter(SendAttempt.status == "success", SendAttempt.sent_at >= today_start).count()
+    sent_today = db.query(SendAttempt).filter(SendAttempt.provider_accepted.is_(True), SendAttempt.sent_at >= today_start).count()
     new_replies = db.query(Reply).filter(Reply.received_at >= last_24h).count()
     needs_response = (
         db.query(Contact)

@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
-import json
 import os
-import time
-import uuid
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -17,10 +11,12 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from app.audit.service import emit_event
-from app.core.crypto import get_fernet_key, redacted_error
+from app.core.crypto import redacted_error
 from app.db.session import get_db
+from app.security.authorization import security_status
+from app.security.oauth_state import consume_oauth_state, issue_oauth_state
 from app.send.smtp_adapter import GmailAdapter
-from app.settings.service import get_secret, get_value, set_settings, set_value, settings_read
+from app.settings.service import get_bool, get_secret, get_value, set_settings, set_value, settings_read
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -30,7 +26,6 @@ GMAIL_API_SCOPES = (
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.metadata",
 )
-OAUTH_STATE_TTL_SECONDS = 10 * 60
 
 
 class SettingsWrite(BaseModel):
@@ -44,58 +39,38 @@ class GmailApiOAuthStart(BaseModel):
 
 
 @router.get("")
-def read_settings(db: Session = Depends(get_db)):
-    return settings_read(db)
+def read_settings(request: Request, db: Session = Depends(get_db)):
+    return _with_security_status(request, settings_read(db))
 
 
 @router.post("")
-def update_settings(payload: SettingsWrite, db: Session = Depends(get_db)):
-    return set_settings(db, payload.model_dump(exclude_unset=True))
+def update_settings(payload: SettingsWrite, request: Request, db: Session = Depends(get_db)):
+    data = payload.model_dump(exclude_unset=True)
+    if os.getenv("FINIMATIC_HOSTING_MODE", "").strip().lower() == "render_free" and data.get("email_transport") == "smtp":
+        raise HTTPException(status_code=422, detail="hosted_transport_requires_gmail_api")
+    enabled = bool(data.get("auto_reply_enabled", get_bool(db, "auto_reply_enabled")))
+    mode = str(data.get("auto_reply_mode", get_value(db, "auto_reply_mode", "propose")))
+    if enabled and mode == "autonomous":
+        if get_bool(db, "auto_reply_kill_switch") or not get_bool(db, "auto_reply_autonomous_authorized"):
+            raise HTTPException(status_code=409, detail="autonomous_confirmation_required")
+    if data.get("auto_reply_enabled") is False:
+        set_value(db, "auto_reply_autonomous_authorized", "false")
+        set_value(db, "auto_reply_kill_switch", "true")
+    if data.get("auto_reply_mode") == "propose":
+        set_value(db, "auto_reply_autonomous_authorized", "false")
+        set_value(db, "auto_reply_kill_switch", "true")
+    return _with_security_status(request, set_settings(db, data))
 
 
-def _b64url_encode(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-
-
-def _b64url_decode(value: str) -> bytes:
-    padding = "=" * (-len(value) % 4)
-    return base64.urlsafe_b64decode(f"{value}{padding}".encode("ascii"))
-
-
-def _oauth_state_secret() -> bytes:
-    return get_fernet_key().encode("utf-8")
-
-
-def _sign_state_payload(payload: bytes) -> bytes:
-    return hmac.new(_oauth_state_secret(), payload, hashlib.sha256).digest()
-
-
-def _encode_oauth_state(return_url: str) -> str:
-    payload = json.dumps(
-        {"nonce": uuid.uuid4().hex, "return_url": return_url, "ts": int(time.time())},
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return f"{_b64url_encode(payload)}.{_b64url_encode(_sign_state_payload(payload))}"
-
-
-def _decode_oauth_state(state: str) -> dict[str, Any]:
-    try:
-        payload_part, signature_part = state.split(".", 1)
-        payload = _b64url_decode(payload_part)
-        signature = _b64url_decode(signature_part)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="invalid_oauth_state") from exc
-    if not hmac.compare_digest(signature, _sign_state_payload(payload)):
-        raise HTTPException(status_code=400, detail="invalid_oauth_state")
-    try:
-        parsed = json.loads(payload.decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail="invalid_oauth_state") from exc
-    ts = int(parsed.get("ts", 0))
-    if int(time.time()) - ts > OAUTH_STATE_TTL_SECONDS:
-        raise HTTPException(status_code=400, detail="expired_oauth_state")
-    return parsed
+def _with_security_status(request: Request, settings: dict[str, Any]) -> dict[str, Any]:
+    status = security_status(request)
+    return {
+        **settings,
+        "api_security_mode": status["mode"],
+        "api_security_enforced": status["authentication_enforced"] and status["authorization_enforced"],
+        "release_blocked": status["release_blocked"],
+        "release_block_reason": status["release_block_reason"],
+    }
 
 
 def _callback_url(request: Request) -> str:
@@ -179,9 +154,10 @@ async def _verify_email_provider(db: Session):
     except Exception as exc:
         readiness = "failed"
         emit_event(db, "sender.smtp_failed", payload={"transport": transport, "error_detail": redacted_error(exc)})
-    if readiness in {"smtp_verified", "provider_verified"}:
+    if readiness in {"configured", "smtp_verified", "provider_verified"}:
         set_value(db, "sender_readiness", readiness)
-        emit_event(db, "sender.smtp_verified", payload={"gmail_user": user, "transport": transport})
+        event_type = "sender.transport_simulated" if readiness == "configured" else "sender.smtp_verified"
+        emit_event(db, event_type, payload={"gmail_user": user, "transport": transport})
         db.commit()
         return {"readiness": readiness}
     set_value(db, "sender_readiness", "failed")
@@ -216,7 +192,10 @@ def start_gmail_api_oauth(payload: GmailApiOAuthStart, request: Request, db: Ses
 
     redirect_uri = _callback_url(request)
     return_url = _safe_return_url(payload.return_url)
-    state = _encode_oauth_state(return_url)
+    principal = getattr(request.state, "principal", None)
+    if not isinstance(principal, dict):
+        raise HTTPException(status_code=401, detail="authentication_invalid")
+    state = issue_oauth_state(db, principal=principal, return_url=return_url)
     authorization_params = {
         "access_type": "offline",
         "client_id": client_id,
@@ -245,23 +224,27 @@ async def gmail_api_oauth_callback(
     error: str | None = None,
     db: Session = Depends(get_db),
 ):
-    return_url = _default_return_url()
-    if state:
-        state_payload = _decode_oauth_state(state)
-        return_url = _safe_return_url(str(state_payload.get("return_url") or ""))
+    if not state:
+        raise HTTPException(status_code=400, detail="missing_oauth_state")
+    callback_principal = getattr(request.state, "principal", None)
+    if not isinstance(callback_principal, dict):
+        raise HTTPException(status_code=401, detail="authentication_invalid")
+    state_record = consume_oauth_state(db, state=state, principal=callback_principal)
+    return_url = _safe_return_url(state_record.return_url)
+    actor = state_record.subject
     if error:
-        emit_event(db, "gmail_api.oauth_failed", payload={"error": error})
+        emit_event(db, "gmail_api.oauth_failed", actor=actor, payload={"error": error})
         db.commit()
         return RedirectResponse(_append_query(return_url, {"gmail_api_oauth": "failed"}), status_code=303)
-    if not code or not state:
-        emit_event(db, "gmail_api.oauth_failed", payload={"error": "missing_code_or_state"})
+    if not code:
+        emit_event(db, "gmail_api.oauth_failed", actor=actor, payload={"error": "missing_code"})
         db.commit()
-        raise HTTPException(status_code=400, detail="missing_code_or_state")
+        raise HTTPException(status_code=400, detail="missing_oauth_code")
 
     client_id = get_secret(db, "gmail_api_client_id")
     client_secret = get_secret(db, "gmail_api_client_secret")
     if not client_id or not client_secret:
-        emit_event(db, "gmail_api.oauth_failed", payload={"error": "missing_client_credentials"})
+        emit_event(db, "gmail_api.oauth_failed", actor=actor, payload={"error": "missing_client_credentials"})
         db.commit()
         raise HTTPException(status_code=400, detail="gmail_api_client_credentials_required")
 
@@ -273,13 +256,13 @@ async def gmail_api_oauth_callback(
             redirect_uri=_callback_url(request),
         )
     except Exception as exc:
-        emit_event(db, "gmail_api.oauth_failed", payload={"error_detail": redacted_error(exc)})
+        emit_event(db, "gmail_api.oauth_failed", actor=actor, payload={"error_detail": redacted_error(exc)})
         db.commit()
         return RedirectResponse(_append_query(return_url, {"gmail_api_oauth": "failed"}), status_code=303)
 
     refresh_token = str(token_payload.get("refresh_token") or "")
     if not refresh_token:
-        emit_event(db, "gmail_api.oauth_failed", payload={"error": "refresh_token_missing"})
+        emit_event(db, "gmail_api.oauth_failed", actor=actor, payload={"error": "refresh_token_missing"})
         db.commit()
         return RedirectResponse(_append_query(return_url, {"gmail_api_oauth": "refresh_token_missing"}), status_code=303)
 
@@ -288,6 +271,7 @@ async def gmail_api_oauth_callback(
     emit_event(
         db,
         "gmail_api.oauth_connected",
+        actor=actor,
         payload={"readiness": verify_result.get("readiness"), "scope": token_payload.get("scope", "")},
     )
     db.commit()

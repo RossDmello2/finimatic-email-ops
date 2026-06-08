@@ -1,5 +1,6 @@
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
-const SESSION_KEY = "va_session_token";
+const API_URL = "";
+let assistantSessionId: string | null = null;
+sessionStorage.removeItem("va_session_token");
 
 export type AgentModel = "auto" | "groq" | "gemini";
 
@@ -15,11 +16,17 @@ export type AgentDraft = {
 export type PendingAction = {
   action_id: string;
   capability: string;
-  draft_id: string;
-  contact_id: string;
-  to: string;
-  subject: string;
-  body: string;
+  draft_id?: string;
+  contact_id?: string;
+  to?: string;
+  subject?: string;
+  body?: string;
+  entity_type?: string;
+  entity_id?: string;
+  goal?: string;
+  evidence_summary?: string;
+  policy_result?: string;
+  proposed_side_effect?: string;
   confirmation_prompt: string;
   expires_at: string;
 };
@@ -48,20 +55,20 @@ function makeId(prefix: string) {
 }
 
 export function getSessionToken() {
-  const existing = sessionStorage.getItem(SESSION_KEY);
-  if (existing) return existing;
-  const next = makeId("session");
-  sessionStorage.setItem(SESSION_KEY, next);
-  return next;
+  if (!assistantSessionId) assistantSessionId = makeId("session");
+  return assistantSessionId;
 }
 
 async function request<T>(path: string, init: RequestInit): Promise<T> {
+  const method = (init.method ?? "GET").toUpperCase();
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...(!["GET", "HEAD", "OPTIONS"].includes(method) ? { "X-Finimatic-CSRF": "1" } : {}),
       ...(init.headers ?? {})
-    }
+    },
+    credentials: "same-origin"
   });
   const text = await response.text();
   let parsed: any = null;

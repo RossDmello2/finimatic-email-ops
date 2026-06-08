@@ -11,8 +11,16 @@ from app.audit.service import emit_event
 from app.ai.gateway import GROQ_MODEL_DEFAULT
 from app.ai.groq_pool import GroqKeyPool
 from app.contacts.utils import contact_tags, resolve_tokens
-from app.db.models import CampaignPlan, Contact, Draft
+from app.db.models import CampaignPlan, Contact, Draft, FollowUpSequence
 from app.db.session import get_db
+from app.drafts.service import invalidate_draft_approval
+from app.send.sequence import (
+    CAMPAIGN_STEP_DEFAULT_DELAYS,
+    campaign_step_definition,
+    campaign_step_error,
+    followup_belongs_to_campaign,
+)
+from app.send.stop_service import FOLLOWUP_STOPPABLE_STATUSES
 from app.settings.service import get_key_list, get_value
 
 router = APIRouter(prefix="/api/campaigns", tags=["campaigns"])
@@ -43,9 +51,9 @@ def campaign_to_dict(row: CampaignPlan) -> dict:
         "name": row.name,
         "goal": row.goal,
         "target_tags": row.target_tags,
-        "step_1_draft": _decode_step(row.step_1_draft),
-        "step_2_draft": _decode_step(row.step_2_draft),
-        "step_3_draft": _decode_step(row.step_3_draft),
+        "step_1_draft": _decode_step(row.step_1_draft, 1),
+        "step_2_draft": _decode_step(row.step_2_draft, 2),
+        "step_3_draft": _decode_step(row.step_3_draft, 3),
         "status": row.status,
         "contacts_count": row.contacts_count,
         "sent_count": row.sent_count,
@@ -100,7 +108,37 @@ def patch_campaign(campaign_id: str, payload: CampaignPatch, db: Session = Depen
     for field in ("step_1_draft", "step_2_draft", "step_3_draft"):
         value = getattr(payload, field)
         if value is not None:
-            setattr(row, field, _encode_step(value))
+            sequence_num = int(field.split("_")[1])
+            setattr(row, field, _encode_step(value, sequence_num))
+    if payload.status in {"paused", "stopped"}:
+        drafts = db.query(Draft).filter(Draft.notes.like(f"campaign:{row.id}:step%")).all()
+        for draft in drafts:
+            invalidate_draft_approval(db, draft, reason="CAMPAIGN_NOT_ACTIVE")
+        draft_ids = [draft.id for draft in drafts]
+        followups = [
+            followup
+            for followup in db.query(FollowUpSequence)
+            .filter(FollowUpSequence.status.in_(FOLLOWUP_STOPPABLE_STATUSES))
+            .all()
+            if followup_belongs_to_campaign(db, followup, row.id)
+        ]
+        for followup in followups:
+            followup_draft_id = followup.pending_draft_id or followup.draft_id
+            followup_draft = db.get(Draft, followup_draft_id) if followup_draft_id else None
+            if followup_draft and followup_draft.id not in draft_ids:
+                invalidate_draft_approval(db, followup_draft, reason="CAMPAIGN_NOT_ACTIVE")
+            followup.status = "stopped"
+            followup.stop_reason = "CAMPAIGN_NOT_ACTIVE"
+        emit_event(
+            db,
+            "campaign.paused" if payload.status == "paused" else "campaign.stopped",
+            entity_type="campaign_plan",
+            entity_id=row.id,
+            payload={
+                "invalidated_draft_ids": draft_ids,
+                "stopped_followup_ids": [followup.id for followup in followups],
+            },
+        )
     db.commit()
     return campaign_to_dict(row)
 
@@ -110,10 +148,21 @@ def activate_campaign(campaign_id: str, db: Session = Depends(get_db)):
     row = db.get(CampaignPlan, campaign_id)
     if not row:
         raise HTTPException(status_code=404, detail="campaign not found")
-    step = _decode_step(row.step_1_draft)
+    for sequence_num in (1, 2, 3):
+        error = campaign_step_error(row, sequence_num)
+        if error:
+            raise HTTPException(status_code=422, detail=error)
+    step = campaign_step_definition(row, 1)
     contacts = _matching_contacts(db, row.target_tags or "")
     created = 0
     for contact in contacts:
+        existing = (
+            db.query(Draft)
+            .filter_by(contact_id=contact.id, notes=f"campaign:{row.id}:step1")
+            .first()
+        )
+        if existing:
+            continue
         draft = Draft(
             contact_id=contact.id,
             subject=resolve_tokens(str(step.get("subject") or ""), contact),
@@ -146,10 +195,10 @@ def suggest_campaign_steps(db: Session, payload: CampaignCreate) -> dict[str, di
         f"Sender: {sender_name}, {sender_role}. Offer: {sender_offer}.\n"
         f"Campaign goal: {payload.goal}.\n"
         "Return JSON with exactly 3 keys: step_1, step_2, step_3.\n"
-        "Each key: {subject: string, body: string, purpose: string}\n"
-        "step_1: initial outreach\n"
-        "step_2: value-add follow-up (3 days later)\n"
-        "step_3: polite breakup email (6 days later)"
+        "Each key: {subject: string, body: string, purpose: string, delay_days: integer}\n"
+        "step_1: initial outreach, delay_days 0\n"
+        "step_2: value-add follow-up, delay_days 3 after step 1 acceptance\n"
+        "step_3: polite breakup email, delay_days 3 after step 2 acceptance"
     )
     try:
         raw = _call_groq_campaign(db, key, prompt)
@@ -174,43 +223,62 @@ def _call_groq_campaign(db: Session, api_key: str, prompt: str) -> str:
     return response.choices[0].message.content or ""
 
 
-def _validate_steps(parsed: dict) -> dict[str, dict[str, str]]:
+def _validate_steps(parsed: dict) -> dict[str, dict[str, Any]]:
     output = _empty_steps()
-    for key in ("step_1", "step_2", "step_3"):
+    for sequence_num, key in enumerate(("step_1", "step_2", "step_3"), start=1):
         value = parsed.get(key)
         if not isinstance(value, dict):
+            return _empty_steps()
+        delay = value.get("delay_days", CAMPAIGN_STEP_DEFAULT_DELAYS[sequence_num])
+        if isinstance(delay, bool):
+            return _empty_steps()
+        try:
+            delay_days = int(delay)
+        except (TypeError, ValueError):
             return _empty_steps()
         output[key] = {
             "subject": str(value.get("subject") or ""),
             "body": str(value.get("body") or ""),
             "purpose": str(value.get("purpose") or ""),
+            "delay_days": delay_days,
         }
     return output
 
 
-def _empty_steps() -> dict[str, dict[str, str]]:
+def _empty_steps() -> dict[str, dict[str, Any]]:
     return {
-        "step_1": {"subject": "", "body": "", "purpose": "initial outreach"},
-        "step_2": {"subject": "", "body": "", "purpose": "value-add follow-up"},
-        "step_3": {"subject": "", "body": "", "purpose": "polite breakup email"},
+        "step_1": {"subject": "", "body": "", "purpose": "initial outreach", "delay_days": 0},
+        "step_2": {"subject": "", "body": "", "purpose": "value-add follow-up", "delay_days": 3},
+        "step_3": {"subject": "", "body": "", "purpose": "polite breakup email", "delay_days": 3},
     }
 
 
-def _decode_step(raw: str | None) -> dict[str, str]:
+def _decode_step(raw: str | None, sequence_num: int | None = None) -> dict[str, Any]:
     try:
         value = json.loads(raw or "{}")
     except json.JSONDecodeError:
         value = {}
     if not isinstance(value, dict):
         value = {}
-    return {
+    result: dict[str, Any] = {
         "subject": str(value.get("subject") or ""),
         "body": str(value.get("body") or ""),
         "purpose": str(value.get("purpose") or ""),
     }
+    if sequence_num is not None:
+        delay = value.get("delay_days", CAMPAIGN_STEP_DEFAULT_DELAYS[sequence_num])
+        if isinstance(delay, bool):
+            delay = -1
+        try:
+            result["delay_days"] = int(delay)
+        except (TypeError, ValueError):
+            result["delay_days"] = -1
+    elif "delay_days" in value:
+        result["delay_days"] = value["delay_days"]
+    return result
 
 
-def _encode_step(value: dict[str, Any] | str) -> str:
+def _encode_step(value: dict[str, Any] | str, sequence_num: int | None = None) -> str:
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
@@ -218,7 +286,7 @@ def _encode_step(value: dict[str, Any] | str) -> str:
             parsed = {"subject": "", "body": value, "purpose": ""}
     else:
         parsed = value
-    return json.dumps(_decode_step(json.dumps(parsed)))
+    return json.dumps(_decode_step(json.dumps(parsed), sequence_num))
 
 
 def _matching_contacts(db: Session, target_tags: str) -> list[Contact]:

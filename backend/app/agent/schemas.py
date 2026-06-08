@@ -17,9 +17,29 @@ Capability = Literal[
     "email_generate_draft",
     "email_update_draft",
     "email_send_draft",
+    "conversation_send_reply",
+    "auto_reply_approve",
+    "auto_reply_enable_autonomous",
     "contact_resolve",
     "followup_status",
     "queue_status",
+    "evidence_read_contact",
+    "evidence_check_draft",
+    "enrichment_run_contact",
+    "enrichment_run_selected",
+    "verification_run_contact",
+    "verification_run_selected",
+    "deliverability_read_summary",
+    "deliverability_explain_queue_block",
+    "workflow_run_start",
+    "workflow_retry_failed",
+    "crm_preview_sync",
+    "crm_confirm_sync",
+    "campaign_policy_check",
+    "campaign_activate",
+    "sequence_enroll_contacts",
+    "mailbox_ramp_preview",
+    "mailbox_ramp_confirm",
 ]
 
 
@@ -82,18 +102,24 @@ class EvidenceEnvelope(StrictModel):
 class PendingEmailAction(StrictModel):
     action_id: str
     capability: str = "email_send_draft"
-    draft_id: str
-    contact_id: str
-    to: str
-    subject: str
-    body: str
+    draft_id: str | None = None
+    contact_id: str | None = None
+    to: str | None = None
+    subject: str | None = None
+    body: str | None = None
+    entity_type: str | None = None
+    entity_id: str | None = None
+    goal: str | None = None
+    evidence_summary: str | None = None
+    policy_result: str | None = None
+    proposed_side_effect: str | None = None
     confirmation_prompt: str
     expires_at: datetime
 
     @field_validator("body")
     @classmethod
-    def truncate_preview_body(cls, value: str) -> str:
-        return value[:5000]
+    def truncate_preview_body(cls, value: str | None) -> str | None:
+        return value[:5000] if value else value
 
 
 class AgentDraft(StrictModel):

@@ -12,14 +12,17 @@ from app.replies import imap_fetcher
 from app.replies.service import create_reply_record
 from conftest import configure_sender
 
+PHASE12_SESSION = "phase12-auto-reply-session"
+
 
 def _configure_auto(client, *, mode="propose", dry_run=False, cap=20, min_gap=60):
     configure_sender(client, canary_verified=True, dry_run=dry_run)
+    settings_mode = "propose" if mode == "autonomous" else mode
     response = client.post(
         "/api/settings",
         json={
             "auto_reply_enabled": True,
-            "auto_reply_mode": mode,
+            "auto_reply_mode": settings_mode,
             "auto_reply_daily_cap": cap,
             "auto_reply_min_gap_minutes": min_gap,
             "auto_reply_safe_intents": "positive_interest,objection,question",
@@ -29,6 +32,35 @@ def _configure_auto(client, *, mode="propose", dry_run=False, cap=20, min_gap=60
         },
     )
     assert response.status_code == 200
+    if mode == "autonomous":
+        prepared = client.post(
+            "/api/auto-reply/autonomous/prepare",
+            json={"session_token": PHASE12_SESSION},
+        )
+        assert prepared.status_code == 202
+        confirmed = client.post(
+            "/api/auto-reply/autonomous/confirm",
+            json={
+                "session_token": PHASE12_SESSION,
+                "action_id": prepared.json()["pending_action"]["action_id"],
+            },
+        )
+        assert confirmed.status_code == 200
+
+
+def _approve_auto_reply(client, draft_id: str):
+    prepared = client.post(
+        f"/api/auto-reply/approve/{draft_id}",
+        json={"session_token": PHASE12_SESSION},
+    )
+    assert prepared.status_code == 202
+    return client.post(
+        f"/api/auto-reply/confirm/{draft_id}",
+        json={
+            "session_token": PHASE12_SESSION,
+            "action_id": prepared.json()["pending_action"]["action_id"],
+        },
+    )
 
 
 def _contact(client, email="auto@example.com", name="Auto Contact", **extra):
@@ -488,7 +520,7 @@ def test_auto_reply_approve_endpoint(client, monkeypatch):
         result = asyncio.run(AutoReplyService().generate_and_maybe_send(contact["id"], reply_id, "propose", db))
         db.commit()
 
-    response = client.post(f"/api/auto-reply/approve/{result.draft_id}")
+    response = _approve_auto_reply(client, result.draft_id)
 
     assert response.status_code == 200
     assert response.json()["status"] == "sent"
@@ -538,7 +570,7 @@ def test_auto_reply_approval_allows_reset_contact_with_old_unsubscribe(client, m
         result = asyncio.run(AutoReplyService().generate_and_maybe_send(contact["id"], reply_id, "propose", db))
         db.commit()
 
-    response = client.post(f"/api/auto-reply/approve/{result.draft_id}")
+    response = _approve_auto_reply(client, result.draft_id)
 
     assert response.status_code == 200
     assert response.json()["status"] == "sent"

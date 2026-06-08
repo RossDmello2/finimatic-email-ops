@@ -15,7 +15,7 @@ on:
       frontend_url:
         description: "Frontend URL to verify"
         required: true
-        default: "https://rossdmello2.github.io/email-automation/"
+        default: "https://finimatic-frontend.vercel.app/"
   schedule:
     - cron: "17 */12 * * *"
 
@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BACKEND_URL: ${{ inputs.backend_url || 'https://finimatic-backend.onrender.com' }}
-      FRONTEND_URL: ${{ inputs.frontend_url || 'https://rossdmello2.github.io/email-automation/' }}
+      FRONTEND_URL: ${{ inputs.frontend_url || 'https://finimatic-frontend.vercel.app/' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4

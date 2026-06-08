@@ -5,8 +5,10 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.audit.service import emit_event
-from app.db.models import Suppression
+from app.db.models import Contact, Suppression
 from app.db.session import get_db
+from app.replies.service import refresh_contact_status_after_reply_change
+from app.send.stop_service import stop_contact_send_work
 
 router = APIRouter(prefix="/api/suppressions", tags=["suppressions"])
 
@@ -42,6 +44,10 @@ def create_suppression(payload: SuppressionCreate, db: Session = Depends(get_db)
         db.add(row)
         db.flush()
         emit_event(db, "suppression.added", entity_type="suppression", entity_id=row.id, payload={"email": email, "reason": payload.reason})
+    contact = db.query(Contact).filter(Contact.email == email, Contact.deleted_at.is_(None)).first()
+    if contact:
+        contact.status = "suppressed"
+        stop_contact_send_work(db, contact.id, "RECIPIENT_SUPPRESSED")
     db.commit()
     return suppression_to_dict(row)
 
@@ -52,7 +58,11 @@ def delete_suppression(suppression_id: str, db: Session = Depends(get_db)):
     if row is None:
         raise HTTPException(status_code=404, detail="suppression not found")
     payload = {"email": row.email, "reason": row.reason}
+    contact = db.query(Contact).filter(Contact.email == row.email, Contact.deleted_at.is_(None)).first()
     db.delete(row)
+    db.flush()
+    if contact:
+        refresh_contact_status_after_reply_change(db, contact)
     emit_event(db, "suppression.removed", entity_type="suppression", entity_id=suppression_id, payload=payload)
     db.commit()
     return {"deleted": True, "id": suppression_id}

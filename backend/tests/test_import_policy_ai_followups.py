@@ -17,7 +17,7 @@ from app.ai.prompts import (
 )
 from app.ai.schema import AIFailure, DraftSuggestion
 from app.conversations.router import ConversationGenerate, _conversation_prompt, _sanitize_conversation_result
-from app.db.models import Contact, ConversationMessage, Draft, SendAttempt, SendQueue, Suppression
+from app.db.models import Contact, ConversationMessage, Draft, Reply, SendAttempt, SendQueue, Suppression
 from app.db.session import SessionLocal
 from app.replies.imap_fetcher import IMAPReplyFetcher
 from app.replies.service import create_reply_record
@@ -25,6 +25,26 @@ from conftest import configure_sender
 
 
 SAMPLE_SENDER_SIGNATURE = "Best regards\nRoss Dmello\nAI Systems Engineer"
+PHASE12_SESSION = "phase12-import-policy-session"
+
+
+def _governed_conversation_send(client, contact_id: str, subject: str, body: str):
+    prepared = client.post(
+        f"/api/conversations/{contact_id}/send",
+        json={"session_token": PHASE12_SESSION, "subject": subject, "body": body},
+    )
+    if prepared.status_code != 202:
+        return prepared
+    action_id = prepared.json()["pending_action"]["action_id"]
+    return client.post(
+        f"/api/conversations/{contact_id}/confirm-send",
+        json={
+            "session_token": PHASE12_SESSION,
+            "action_id": action_id,
+            "subject": subject,
+            "body": body,
+        },
+    )
 
 
 def test_import_preview_commit_and_recommit_are_replay_safe(client):
@@ -84,6 +104,38 @@ def test_import_commit_can_accept_rows_directly(client):
     assert client.get("/api/contacts").json()["total"] == 2
 
 
+def test_import_commit_does_not_automatically_call_ai_enrichment(client, monkeypatch):
+    configure_sender(client)
+    calls: list[str] = []
+
+    async def record_enrichment(_gateway, contact):
+        calls.append(contact.id)
+        return "provider-generated personalization"
+
+    monkeypatch.setattr(AIGateway, "enrich_contact", record_enrichment)
+    committed = client.post(
+        "/api/import/commit",
+        json={
+            "format": "csv",
+            "filename": "synthetic.csv",
+            "rows": [
+                {
+                    "email": "phase14-import@creator.test",
+                    "creator_name": "Phase 14 Import",
+                    "website_url": "https://phase14-import.creator.test",
+                    "source": "synthetic",
+                }
+            ],
+        },
+    )
+
+    assert committed.status_code == 200
+    assert committed.json()["summary"]["accepted"] == 1
+    assert calls == []
+    contact = client.get("/api/contacts").json()["items"][0]
+    assert contact["personalization"] is None
+
+
 def test_import_commit_restores_soft_deleted_contact(client):
     contact = client.post("/api/contacts", json={"email": "restore-import@example.com", "creator_name": "Old Name", "source": "manual"}).json()
     assert client.delete(f"/api/contacts/{contact['id']}").status_code == 200
@@ -101,6 +153,83 @@ def test_import_commit_restores_soft_deleted_contact(client):
     assert active["total"] == 1
     assert active["items"][0]["email"] == "restore-import@example.com"
     assert active["items"][0]["creator_name"] == "Restored Name"
+
+
+def test_editing_approved_draft_requires_reapproval_and_cancels_queue(client):
+    configure_sender(client, canary_verified=True, dry_run=False)
+    contact = client.post(
+        "/api/contacts",
+        json={
+            "email": "phase14-edit-approved@recipient.test",
+            "creator_name": "Approved Draft",
+            "source": "synthetic",
+        },
+    ).json()
+    draft = client.post(
+        "/api/drafts",
+        json={"contact_id": contact["id"], "subject": "Reviewed", "body": "Reviewed content."},
+    ).json()
+    queued = _queue_approved_draft_without_sending(client, contact["id"], draft["id"])
+
+    edited = client.patch(
+        f"/api/drafts/{draft['id']}",
+        json={"subject": "Changed after review", "body": "Changed content."},
+    )
+    processed = client.post("/api/queue/process").json()
+
+    assert edited.status_code == 200
+    assert edited.json()["approved"] is False
+    with SessionLocal() as db:
+        queue = db.get(SendQueue, queued["id"])
+        assert queue.status == "cancelled"
+        assert "DRAFT_EDITED_REQUIRES_REAPPROVAL" in (queue.policy_block_reasons or "")
+    assert processed["provider_accepted"] == 0
+    assert len(client.app.state.transport.sent) == 0
+
+
+def test_blank_and_unresolved_template_drafts_cannot_be_approved(client):
+    configure_sender(client, canary_verified=True, dry_run=False)
+    contact = client.post(
+        "/api/contacts",
+        json={"email": "phase14-content-gate@recipient.test", "creator_name": "Content Gate", "source": "synthetic"},
+    ).json()
+    blank = client.post(
+        "/api/drafts",
+        json={"contact_id": contact["id"], "subject": "", "body": ""},
+    ).json()
+    unresolved = client.post(
+        "/api/drafts",
+        json={
+            "contact_id": contact["id"],
+            "subject": "Hello {{missing_subject}}",
+            "body": "Hi {{unknown_field}}, here is the reviewed message.",
+        },
+    ).json()
+
+    blank_approve = client.post(f"/api/drafts/{blank['id']}/approve")
+    unresolved_approve = client.post(f"/api/drafts/{unresolved['id']}/approve")
+
+    assert blank_approve.status_code == 422
+    assert "DRAFT_SUBJECT_EMPTY" in blank_approve.text
+    assert "DRAFT_BODY_EMPTY" in blank_approve.text
+    assert unresolved_approve.status_code == 422
+    assert "DRAFT_UNRESOLVED_TEMPLATE_TOKEN" in unresolved_approve.text
+    assert client.get("/api/queue").json()["total"] == 0
+
+
+def test_headerless_import_keeps_first_row_when_name_cell_matches_header_alias(client):
+    content = "first@example.com,name,https://first.example\nsecond@example.com,Second,https://second.example"
+
+    preview = client.post(
+        "/api/import/preview",
+        json={"format": "csv", "content": content, "filename": "headerless.csv"},
+    )
+
+    assert preview.status_code == 200
+    rows = preview.json()["rows"]
+    assert len(rows) == 2
+    assert rows[0]["email"] == "first@example.com"
+    assert rows[0]["parsed_data"]["creator_name"] == "name"
 
 
 def test_import_preview_normalizes_uploaded_row_headers(client):
@@ -781,6 +910,127 @@ def test_bulk_generation_template_plus_ai_passes_template_instruction(client, mo
     assert "Ask if we can meet" in drafts[0]["body"]
 
 
+def test_bulk_generation_replaces_existing_unapproved_draft(client, monkeypatch):
+    monkeypatch.setenv("FINIMATIC_FAKE_AI", "1")
+    contact = client.post(
+        "/api/contacts",
+        json={"email": "bulk-replace@example.com", "creator_name": "Bulk Replace", "source": "manual"},
+    ).json()
+    existing = client.post(
+        "/api/drafts",
+        json={"contact_id": contact["id"], "subject": "Old subject", "body": "Old body"},
+    ).json()
+
+    job = client.post(
+        "/api/drafts/generate-bulk",
+        json={"contact_ids": [contact["id"]], "provider": "groq", "tone": "Friendly"},
+    ).json()
+    status = _wait_for_bulk_job(client, job["job_id"])
+
+    drafts = client.get("/api/drafts").json()["items"]
+    assert status["generated"] == 1
+    assert status["created"] == 0
+    assert status["updated"] == 1
+    assert status["results"][0]["action"] == "updated"
+    assert len(drafts) == 1
+    assert drafts[0]["id"] == existing["id"]
+    assert drafts[0]["subject"] != "Old subject"
+    assert drafts[0]["body"] != "Old body"
+
+
+def test_bulk_template_fill_creates_and_updates_with_contact_tokens(client):
+    contacts = [
+        client.post(
+            "/api/contacts",
+            json={
+                "email": "template-fill-one@example.com",
+                "creator_name": "Template One",
+                "website_url": "https://one.example",
+                "source": "manual",
+                "tags": "coach, ai",
+            },
+        ).json(),
+        client.post(
+            "/api/contacts",
+            json={
+                "email": "template-fill-two@example.com",
+                "creator_name": "Template Two",
+                "website_url": "https://two.example",
+                "source": "manual",
+                "tags": "course",
+            },
+        ).json(),
+    ]
+    existing = client.post(
+        "/api/drafts",
+        json={"contact_id": contacts[0]["id"], "subject": "Old", "body": "Old"},
+    ).json()
+    template = client.post(
+        "/api/templates",
+        json={
+            "name": "Bulk Template Fill",
+            "subject_template": "Idea for {{first_name}} at {{website}}",
+            "body_template": "Hi {{first_name}}, I saw {{website}}. Tags: {{tags}}.",
+        },
+    ).json()
+
+    job = client.post(
+        "/api/drafts/generate-bulk",
+        json={
+            "contact_ids": [contact["id"] for contact in contacts],
+            "generation_mode": "template_fill",
+            "template_id": template["id"],
+        },
+    ).json()
+    status = _wait_for_bulk_job(client, job["job_id"])
+
+    drafts = sorted(client.get("/api/drafts").json()["items"], key=lambda row: row["contact_id"])
+    first = next(row for row in drafts if row["contact_id"] == contacts[0]["id"])
+    second = next(row for row in drafts if row["contact_id"] == contacts[1]["id"])
+    assert status["generated"] == 2
+    assert status["created"] == 1
+    assert status["updated"] == 1
+    assert first["id"] == existing["id"]
+    assert first["subject"] == "Idea for Template at https://one.example"
+    assert "Tags: coach, ai." in first["body"]
+    assert second["subject"] == "Idea for Template at https://two.example"
+    assert second["ai_provider"] == "template"
+
+
+def test_bulk_template_ai_falls_back_to_filled_template_on_provider_failure(client):
+    contact = client.post(
+        "/api/contacts",
+        json={"email": "template-ai-fallback@example.com", "creator_name": "Fallback Lead", "website_url": "https://fallback.example", "source": "manual"},
+    ).json()
+    template = client.post(
+        "/api/templates",
+        json={
+            "name": "Fallback Template",
+            "subject_template": "Fallback for {{first_name}}",
+            "body_template": "Hi {{first_name}}, I saw {{website}}.",
+        },
+    ).json()
+
+    job = client.post(
+        "/api/drafts/generate-bulk",
+        json={
+            "contact_ids": [contact["id"]],
+            "provider": "malformed_test",
+            "generation_mode": "template_ai",
+            "template_id": template["id"],
+        },
+    ).json()
+    status = _wait_for_bulk_job(client, job["job_id"])
+
+    draft = client.get("/api/drafts").json()["items"][0]
+    assert status["generated"] == 1
+    assert status["failed"] == 0
+    assert status["results"][0]["reason"].startswith("ai_failed_")
+    assert draft["subject"] == "Fallback for Fallback"
+    assert "https://fallback.example" in draft["body"]
+    assert draft["source"] == "template_ai_fallback"
+
+
 def test_template_create_from_approved_draft(client):
     configure_sender(client, canary_verified=True, dry_run=False)
     contact, draft = _make_contact_and_draft(client, email="template@example.com")
@@ -824,8 +1074,9 @@ def test_single_draft_approval_sends_immediately_with_fake_transport(client):
     response = client.post(f"/api/drafts/{draft['id']}/approve").json()
     queue = client.get(f"/api/queue/{response['queue_id']}").json()
 
-    assert response["delivery_status"] == "sent"
-    assert queue["status"] == "sent"
+    assert response["delivery_status"] == "provider_accepted"
+    assert queue["status"] == "provider_accepted"
+    assert queue["latest_attempt"]["provider_accepted"] is True
     assert len(client.app.state.transport.sent) == 1
     assert client.app.state.transport.sent[0]["to"] == contact["email"]
 
@@ -879,7 +1130,7 @@ def test_approving_second_sequence_one_draft_returns_conflict(client):
     assert duplicate.json()["detail"]["reason"] == "sequence_already_sent"
 
 
-def test_approving_after_failed_sequence_one_queue_requeues_new_draft(client):
+def test_approving_after_provider_accepted_queue_marked_failed_requires_next_sequence(client):
     configure_sender(client, canary_verified=True, dry_run=False)
     contact = client.post(
         "/api/contacts",
@@ -887,6 +1138,7 @@ def test_approving_after_failed_sequence_one_queue_requeues_new_draft(client):
     ).json()
     first = client.post("/api/drafts", json={"contact_id": contact["id"], "subject": "First", "body": "First"}).json()
     first_approval = client.post(f"/api/drafts/{first['id']}/approve").json()
+    assert first_approval["delivery_status"] == "provider_accepted"
     queue_id = first_approval["queue_id"]
     with SessionLocal() as db:
         queue = db.get(SendQueue, queue_id)
@@ -897,15 +1149,18 @@ def test_approving_after_failed_sequence_one_queue_requeues_new_draft(client):
 
     retried = client.post(f"/api/drafts/{second['id']}/approve")
 
-    assert retried.status_code == 200
-    assert retried.json()["queue_id"] == queue_id
+    assert retried.status_code == 409
+    assert retried.json()["detail"]["reason"] == "sequence_already_sent"
+    assert retried.json()["detail"]["next_sequence_num"] == 2
     with SessionLocal() as db:
         queue = db.get(SendQueue, queue_id)
-        assert queue.draft_id == second["id"]
-        assert queue.status == "sent"
-        assert json.loads(queue.policy_block_reasons) == []
+        assert queue.draft_id == first["id"]
+        assert queue.status == "failed"
+        assert json.loads(queue.policy_block_reasons) == ["SMTP_SEND_FAILED"]
+        assert db.query(SendAttempt).filter_by(queue_id=queue_id, provider_accepted=True).count() == 1
     event_types = [row["event_type"] for row in client.get("/api/audit").json()["items"]]
-    assert "queue.entry_requeued" in event_types
+    assert "queue.entry_requeued" not in event_types
+    assert len(client.app.state.transport.sent) == 1
 
 
 def test_approving_followup_after_sent_sequence_queues_next_sequence(client):
@@ -918,7 +1173,26 @@ def test_approving_followup_after_sent_sequence_queues_next_sequence(client):
     first_approval = client.post(f"/api/drafts/{first['id']}/approve").json()
     with SessionLocal() as db:
         queue = db.get(SendQueue, first_approval["queue_id"])
-        queue.status = "sent"
+        queue.status = "provider_accepted"
+        db.add(
+            SendAttempt(
+                queue_id=queue.id,
+                contact_id=contact["id"],
+                draft_id=first["id"],
+                idempotency_key=queue.idempotency_key,
+                provider_msg_id="provider-native-sequence-one",
+                status="provider_accepted",
+                sender_identity="sender@example.com",
+                configured_transport="test_provider",
+                effective_transport="test_provider",
+                transport_source="test_fixture",
+                provider_response_classification="test_provider_accepted",
+                provider_accepted=True,
+                provider_contacted=True,
+                simulated=False,
+                sent_at=datetime.now(timezone.utc),
+            )
+        )
         db.commit()
     second = client.post("/api/drafts", json={"contact_id": contact["id"], "subject": "Second", "body": "Second"}).json()
 
@@ -934,7 +1208,7 @@ def test_approving_followup_after_sent_sequence_queues_next_sequence(client):
         assert row.contact_id == contact["id"]
         assert row.draft_id == second["id"]
         assert row.sequence_num == 2
-        assert row.status == "sent"
+        assert row.status == "provider_accepted"
 
 
 def test_policy_blocks_suppressed_paused_replied_bounced_caps_and_idempotency(client):
@@ -994,6 +1268,7 @@ def test_policy_allows_imported_reengagement_after_suppression_removed(client):
             intent="unsubscribe",
         )
         db.query(Suppression).filter(Suppression.email == contact["email"]).delete()
+        db.query(Reply).filter_by(contact_id=contact["id"]).update({"archived_at": datetime.now(timezone.utc)})
         db_contact.status = "imported"
         db.commit()
 
@@ -1001,8 +1276,9 @@ def test_policy_allows_imported_reengagement_after_suppression_removed(client):
     entry = client.get(f"/api/queue/{approved['queue_id']}").json()
     checked = client.get(f"/api/queue/{entry['id']}").json()
 
-    assert approved["delivery_status"] == "sent"
-    assert checked["status"] == "sent"
+    assert approved["delivery_status"] == "provider_accepted"
+    assert checked["status"] == "provider_accepted"
+    assert checked["latest_attempt"]["provider_accepted"] is True
     assert "RECIPIENT_REPLIED" not in checked["policy_block_reasons"]
     assert "RECIPIENT_SUPPRESSED" not in checked["policy_block_reasons"]
 
@@ -1013,22 +1289,20 @@ def test_dry_run_skips_then_same_queue_sends_when_live(client):
     entry = _queue_approved_draft_without_sending(client, contact["id"], draft["id"])
 
     first = client.post("/api/queue/process").json()
-    checked = client.get(f"/api/queue/{entry['id']}").json()
+    skipped = client.get(f"/api/queue/{entry['id']}").json()
     second = client.post("/api/queue/process").json()
 
-    assert first["skipped"] == 1
+    assert first["simulated"] == 1
     assert second["processed"] == 0
-    assert checked["status"] == "skipped"
-    assert checked["policy_block_reasons"] == ["DRY_RUN_ENABLED"]
-    assert checked["last_attempt_error_code"] == "DRY_RUN_ENABLED"
-    listed = client.get("/api/queue").json()["items"]
-    assert listed[0]["last_attempt_error_code"] == "DRY_RUN_ENABLED"
+    assert skipped["status"] == "simulated"
+    assert skipped["latest_attempt"]["provider_accepted"] is False
+    assert skipped["latest_attempt"]["simulated"] is True
     assert len(client.app.state.transport.sent) == 0
 
     client.post("/api/settings", json={"dry_run": False})
     client.post("/api/queue/process")
     sent = client.get(f"/api/queue/{entry['id']}").json()
-    assert sent["status"] == "sent"
+    assert sent["status"] == "provider_accepted"
     assert len(client.app.state.transport.sent) == 1
 
 
@@ -1216,8 +1490,16 @@ def test_imap_thread_headers_map_plus_alias_replies_to_sent_contact(client):
                 contact_id=alias["id"],
                 draft_id="draft-id",
                 idempotency_key="live-persona-1",
-                provider_msg_id=message_id,
-                status="success",
+                provider_msg_id="18f4a8c2d3145678",
+                tracking_message_id=message_id,
+                status="provider_accepted",
+                configured_transport="gmail_api",
+                effective_transport="gmail_api",
+                transport_source="test_fixture",
+                simulated=False,
+                provider_contacted=True,
+                provider_accepted=True,
+                provider_response_classification="gmail_api_accepted",
                 sender_identity="rossdmello869@gmail.com",
                 sent_at=datetime.now(timezone.utc),
             )
@@ -1358,14 +1640,11 @@ def test_conversation_send_records_timeline_with_fake_transport(client, monkeypa
         f"/api/conversations/{contact['id']}/generate-reply",
         json={"provider": "gemini", "instruction": "Ask one practical next question."},
     ).json()
-    sent = client.post(
-        f"/api/conversations/{contact['id']}/send",
-        json={"subject": generated["subject"], "body": generated["body"]},
-    ).json()
+    sent = _governed_conversation_send(client, contact["id"], generated["subject"], generated["body"]).json()
     detail = client.get(f"/api/conversations/{contact['id']}").json()
 
     assert generated["provider"] == "gemini"
-    assert sent["status"] == "success"
+    assert sent["status"] == "provider_accepted"
     assert len(client.app.state.transport.sent) == 1
     assert [message["direction"] for message in detail["messages"]] == ["inbound", "outbound"]
     assert "tied to this offer" in detail["messages"][-1]["body"]
@@ -1593,7 +1872,7 @@ def test_conversation_send_honors_suppression_gate(client):
 
     response = client.post(
         f"/api/conversations/{contact['id']}/send",
-        json={"subject": "Re: conversation", "body": "Following up."},
+        json={"session_token": PHASE12_SESSION, "subject": "Re: conversation", "body": "Following up."},
     )
 
     assert response.status_code == 409
@@ -1611,7 +1890,7 @@ def test_conversation_send_blocks_deleted_contact(client):
 
     response = client.post(
         f"/api/conversations/{contact['id']}/send",
-        json={"subject": "Re: conversation", "body": "Following up."},
+        json={"session_token": PHASE12_SESSION, "subject": "Re: conversation", "body": "Following up."},
     )
 
     assert response.status_code == 409

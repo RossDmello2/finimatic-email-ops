@@ -7,7 +7,7 @@ Create Date: 2026-05-23
 
 from alembic import op
 
-from app.db.models import Base
+from app.db.migrations.schema_0001 import Base
 
 revision = "0001_initial"
 down_revision = None
