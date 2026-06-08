@@ -28,41 +28,6 @@ body,
   width: 100%;
 }
 
-.runtime-banner {
-  background: #ecfdf5;
-  border-bottom: 1px solid #a7f3d0;
-  display: grid;
-  flex: 0 0 auto;
-  gap: 8px;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  padding: 10px 28px;
-}
-
-.runtime-banner.blocked {
-  background: #fff7ed;
-  border-bottom-color: #fed7aa;
-}
-
-.runtime-banner div {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.runtime-banner span {
-  color: #64748b;
-  font-size: 0.68rem;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.runtime-banner strong {
-  color: #0f172a;
-  font-size: 0.78rem;
-  overflow-wrap: anywhere;
-}
-
 .auth-gate {
   align-items: center;
   background: #ffffff;
@@ -93,31 +58,6 @@ body,
   flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
-}
-
-.operator-summary {
-  display: grid;
-  line-height: 1.15;
-  max-width: 240px;
-  text-align: right;
-}
-
-.operator-summary strong,
-.operator-summary span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.operator-summary strong {
-  color: #0f172a;
-  font-size: 0.76rem;
-}
-
-.operator-summary span {
-  color: #64748b;
-  font-size: 0.68rem;
-  text-transform: capitalize;
 }
 
 button,
@@ -1704,11 +1644,6 @@ th input[type="checkbox"] {
     max-height: 176px;
   }
 
-  .runtime-banner {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    padding: 10px 16px;
-  }
-
   .auth-gate,
   .queue-card-head,
   .queue-truth-grid,
@@ -1775,7 +1710,6 @@ th input[type="checkbox"] {
 }
 
 @media (max-width: 560px) {
-  .runtime-banner,
   .sidebar {
     grid-template-columns: 1fr;
   }

@@ -247,36 +247,6 @@ function TransportTruth({ settings, compact = false }: { settings?: SettingsRead
   );
 }
 
-function RuntimeBanner({
-  security,
-  settings,
-  session,
-  authState
-}: {
-  security?: SecurityStatus;
-  settings?: SettingsRead;
-  session?: AuthSession;
-  authState: "checking" | "unauthenticated" | "validating" | "authenticated" | "rejected";
-}) {
-  const identityKind = settings?.gmail_user?.toLowerCase().endsWith(".test")
-    ? "synthetic"
-    : settings?.gmail_user
-      ? "configured"
-      : "unavailable";
-  const authEnforced = security?.authentication_enforced === true;
-  return (
-    <section className={`runtime-banner ${authEnforced && (security?.release_blocked || authState !== "authenticated") ? "blocked" : ""}`} aria-label="Runtime identity, authentication, and transport">
-      <div><span>Identity</span><strong>{identityKind}{settings?.gmail_user ? `: ${settings.gmail_user}` : ""}</strong></div>
-      {authEnforced
-        ? <div><span>Operator</span><strong>{session?.authenticated ? `${session.subject} (${session.roles.join(", ")})` : authState}</strong></div>
-        : <div><span>Access</span><strong>direct use</strong></div>}
-      <div><span>Transport</span><strong>{settings ? `${settings.configured_transport} -> ${settings.effective_transport}` : "loading backend settings"}</strong></div>
-      <div><span>Source</span><strong>{settings?.transport_source ?? "backend settings unavailable"}</strong></div>
-      <div><span>Provider execution</span><strong>{settings ? (settings.transport_simulated ? "simulated; provider not contacted" : "live-capable; policy still applies") : "unknown"}</strong></div>
-    </section>
-  );
-}
-
 function AuthenticationGate({
   security,
   authenticated,
@@ -294,12 +264,12 @@ function AuthenticationGate({
 }) {
   const backendBlocked = security?.release_blocked === true;
   const heading = backendBlocked
-    ? "Backend authentication is not configured"
+    ? "Sign-in setup required"
     : rejected
-      ? "Authenticated session was rejected"
+      ? "Your session has expired"
       : checking
-        ? "Validating authenticated session"
-        : "Authentication required";
+        ? "Opening Finimatic"
+        : "Sign in to continue";
   return (
     <section className="auth-gate" role="status">
       <ShieldCheck className="h-8 w-8 text-accent" />
@@ -307,12 +277,11 @@ function AuthenticationGate({
         <h2>{heading}</h2>
         <p>
           {backendBlocked
-            ? "Operational APIs are fail-closed. Configure the approved interactive OIDC session architecture before release."
+            ? "Configure the hosted sign-in provider before using this deployment."
             : authenticated
-              ? "Operational data remains gated until the backend accepts the authorized session."
-              : "Sign in through the configured identity provider to create a secure operator session."}
+              ? "Finimatic is loading your workspace."
+              : "Sign in to open your Finimatic workspace."}
         </p>
-        <small>Finimatic keeps the browser session in an HttpOnly cookie. Access tokens are not exposed to JavaScript storage.</small>
       </div>
       <div className="auth-actions">
         {!backendBlocked && !authenticated && (
@@ -321,7 +290,7 @@ function AuthenticationGate({
           </button>
         )}
         <button className="button secondary" disabled={checking} onClick={onRetry}>
-          <RefreshCw className={checking ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Retry Session
+          <RefreshCw className={checking ? "h-4 w-4 animate-spin" : "h-4 w-4"} /> Retry
         </button>
       </div>
     </section>
@@ -611,15 +580,6 @@ function App() {
   ].some((query) => query.isError);
   const authRejected = authEnforced && (authSession.isError || (authenticated && authProbe.isError));
   const authChecking = security.isPending || (authEnforced && (authSession.isPending || (authenticated && authProbe.isPending)));
-  const authState: "checking" | "unauthenticated" | "validating" | "authenticated" | "rejected" = authChecking
-    ? "checking"
-    : operationalEnabled
-      ? "authenticated"
-      : authRejected
-        ? "rejected"
-        : authenticated
-          ? "validating"
-          : "unauthenticated";
   const retryAuthentication = () => {
     void security.refetch();
     void authSession.refetch().then((result) => {
@@ -664,12 +624,6 @@ function App() {
           <div className="text-sm text-muted">{settings?.gmail_user || "Sender not configured"}</div>
         </div>
         <div className="flex items-center gap-3">
-          {authEnforced && authSession.data?.authenticated && (
-            <div className="operator-summary">
-              <strong>{authSession.data.subject}</strong>
-              <span>{authSession.data.roles.join(", ")}</span>
-            </div>
-          )}
           <StatusPill value={settings?.sender_readiness ?? "not_configured"} />
           <ModeLabel settings={settings} />
           <ListeningIndicator settings={settings} />
@@ -680,7 +634,6 @@ function App() {
           )}
         </div>
       </header>
-      <RuntimeBanner security={security.data} settings={settings} session={authSession.data} authState={authState} />
 
       <div className="app-shell">
         <aside className="sidebar">
