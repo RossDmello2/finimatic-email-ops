@@ -20,6 +20,8 @@ No production Vercel or Render deploy was performed from this branch.
 - Worktree: `C:\Users\rossd\AppData\Local\Temp\finimatic-hosted-release-convergence-20260608`
 - Branch: `codex/hosted-release-convergence`
 - Base commit: `0bb584f3d4c1496c29edf65cbacebe90f5857063`
+- Release implementation commit: `4f65760`
+- Draft PR: `https://github.com/RossDmello2/finimatic-email-ops/pull/6`
 - Remote: `https://github.com/RossDmello2/finimatic-email-ops.git`
 - GitHub repo verified by CLI: `RossDmello2/finimatic-email-ops`
 - GitHub viewer permission: `ADMIN`
@@ -305,22 +307,22 @@ vercel.json
 - Hosted Render production deploy: NO
 - Existing Supabase archive mutation: NO
 - Fresh Supabase project mutation: YES, created and initialized as the planned new production database candidate.
-- GitHub push/PR: not yet performed in this evidence snapshot.
+- GitHub push/PR: YES, branch pushed and draft PR opened:
+  https://github.com/RossDmello2/finimatic-email-ops/pull/6
 
 ## Remaining Release Blockers
 
-1. Commit and push the branch for review.
-2. Configure Render production secrets:
+1. Configure Render production secrets:
    - fresh Supabase `DATABASE_URL`;
    - `FERNET_KEY`;
    - OIDC app-login issuer/audience/JWKS/client/secret/redirect values;
    - operator/admin subjects.
-3. Configure encrypted Settings after deploy:
+2. Configure encrypted Settings after deploy:
    - Gmail API transport credentials;
    - AI provider keys;
    - sender/recipient identities.
-4. Confirm one bounded Gmail API send at action time.
-5. Run post-deploy auth, CSRF, all-panel, queue, Gmail provider-acceptance, audit, conversation, follow-up, console, CORS, cookie, and secret-exposure checks.
+3. Confirm one bounded Gmail API send at action time.
+4. Run post-deploy auth, CSRF, all-panel, queue, Gmail provider-acceptance, audit, conversation, follow-up, console, CORS, cookie, and secret-exposure checks.
 
 ## Blunt Status
 
