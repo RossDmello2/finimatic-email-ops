@@ -1,10 +1,14 @@
 from datetime import timedelta
+import threading
 
+from app.agent.memory import get_or_create_session
+from app.agent.pending import create_pending_action
 from app.core.time import utcnow
 from app.ai.schema import AIFailure
-from app.db.models import AgentSession, Contact, ConversationMessage, Draft, PendingEmailActionRow, Suppression
+from app.db.models import AgentSession, Contact, ConversationMessage, Draft, PendingAgentAction, PendingEmailActionRow, SendAttempt, Suppression, Workbook, WorkflowRun
 from app.db.session import SessionLocal
 from app.audit.service import emit_event
+from app.replies.service import create_reply_record
 from conftest import configure_sender
 
 
@@ -27,6 +31,13 @@ def _pending_draft(client, monkeypatch, *, email="sarah@example.com", name="Sara
     response = _chat(client, f"generate a reply for {name}")
     assert response["draft"]
     assert response["pending_action"]
+    return response
+
+
+def _pending_workflow_action(client, *, session_token=SESSION_A):
+    response = _chat(client, "start workflow run", session_token=session_token)
+    assert response["pending_action"]
+    assert response["pending_action"]["capability"] == "workflow_run_start"
     return response
 
 
@@ -673,6 +684,190 @@ def test_confirmation_consumed(client, monkeypatch):
     assert len(client.app.state.transport.sent) == 1
 
 
+def test_dry_run_confirmation_is_consumed_before_live_mode(client, monkeypatch):
+    pending = _pending_draft(
+        client,
+        monkeypatch,
+        email="assistant-dry-run-replay@example.com",
+        name="Dry Run Replay",
+    )
+    client.post("/api/settings", json={"dry_run": True})
+    payload = {
+        "session_token": SESSION_A,
+        "action_id": pending["pending_action"]["action_id"],
+    }
+
+    simulated = client.post("/api/agent/confirm", json=payload).json()
+    client.post("/api/settings", json={"dry_run": False})
+    replay = client.post("/api/agent/confirm", json=payload).json()
+
+    assert simulated["error_code"] == "dry_run"
+    assert replay["error_code"] == "consumed"
+    assert len(client.app.state.transport.sent) == 0
+    with SessionLocal() as db:
+        action = db.get(PendingEmailActionRow, pending["pending_action"]["action_id"])
+        assert action.consumed is True
+
+
+def test_distinct_assistant_confirmations_share_one_provider_dispatch(client, monkeypatch):
+    pending = _pending_draft(
+        client,
+        monkeypatch,
+        email="assistant-concurrent@example.com",
+        name="Assistant Concurrent",
+    )
+    draft_id = pending["draft"]["draft_id"]
+    with SessionLocal() as db:
+        draft = db.get(Draft, draft_id)
+        session_b = get_or_create_session(SESSION_B, db)
+        second_action = create_pending_action(
+            session_b.id,
+            draft.id,
+            draft.contact_id,
+            draft.subject,
+            draft.body,
+            db,
+        )
+        db.commit()
+        second_action_id = second_action.id
+
+    original_send = client.app.state.transport.send
+    provider_entered = threading.Event()
+    provider_release = threading.Event()
+
+    def blocking_send(**kwargs):
+        provider_entered.set()
+        assert provider_release.wait(timeout=10)
+        return original_send(**kwargs)
+
+    client.app.state.transport.send = blocking_send
+    first_result: dict = {}
+
+    def confirm_first():
+        response = client.post(
+            "/api/agent/confirm",
+            json={
+                "session_token": SESSION_A,
+                "action_id": pending["pending_action"]["action_id"],
+            },
+        )
+        first_result["status_code"] = response.status_code
+        first_result["body"] = response.json()
+
+    worker = threading.Thread(target=confirm_first, daemon=True)
+    worker.start()
+    assert provider_entered.wait(timeout=10)
+    competing = client.post(
+        "/api/agent/confirm",
+        json={"session_token": SESSION_B, "action_id": second_action_id},
+    )
+    provider_release.set()
+    worker.join(timeout=10)
+    assert not worker.is_alive()
+
+    assert first_result["status_code"] == 200
+    assert first_result["body"]["error_code"] is None
+    assert competing.status_code == 409
+    assert competing.json()["error_code"] == "reconciliation_required"
+    assert len(client.app.state.transport.sent) == 1
+    with SessionLocal() as db:
+        attempts = db.query(SendAttempt).filter_by(queue_id="agent", draft_id=draft_id).all()
+        assert len(attempts) == 1
+        assert attempts[0].provider_accepted is True
+        assert attempts[0].dispatch_lock_key
+
+
+def test_reply_after_assistant_attempt_blocks_provider_dispatch(client, monkeypatch):
+    pending = _pending_draft(
+        client,
+        monkeypatch,
+        email="assistant-stop-fence@example.com",
+        name="Assistant Stop Fence",
+    )
+    draft_id = pending["draft"]["draft_id"]
+    from app.agent import tools as agent_tools
+
+    original_begin = agent_tools.begin_provider_attempt
+
+    def inject_reply_after_attempt(db, **kwargs):
+        attempt, state = original_begin(db, **kwargs)
+        if state == "ready":
+            draft = db.get(Draft, draft_id)
+            create_reply_record(
+                db,
+                db.get(Contact, draft.contact_id),
+                "reply",
+                "Stop before the Assistant provider call.",
+                external_message_id="<assistant-stop-fence@example.com>",
+                stop_followups=True,
+                intent="positive_interest",
+            )
+            db.commit()
+        return attempt, state
+
+    monkeypatch.setattr(agent_tools, "begin_provider_attempt", inject_reply_after_attempt)
+    response = client.post(
+        "/api/agent/confirm",
+        json={"session_token": SESSION_A, "action_id": pending["pending_action"]["action_id"]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "policy_changed_before_provider_call"
+    assert len(client.app.state.transport.sent) == 0
+    with SessionLocal() as db:
+        draft = db.get(Draft, draft_id)
+        attempt = db.query(SendAttempt).filter_by(queue_id="agent", draft_id=draft_id).one()
+        contact = db.get(Contact, draft.contact_id)
+        assert attempt.status == "blocked"
+        assert attempt.provider_contacted is False
+        assert attempt.provider_accepted is False
+        assert contact.send_stop_generation > attempt.stop_generation
+        assert db.query(ConversationMessage).filter_by(contact_id=draft.contact_id, direction="outbound").count() == 0
+
+
+def test_assistant_stop_during_provider_call_requires_reconciliation(client, monkeypatch):
+    pending = _pending_draft(
+        client,
+        monkeypatch,
+        email="assistant-late-stop@example.com",
+        name="Assistant Late Stop",
+    )
+    draft_id = pending["draft"]["draft_id"]
+    original_send = client.app.state.transport.send
+
+    def accept_then_stop(**kwargs):
+        outcome = original_send(**kwargs)
+        with SessionLocal() as db:
+            draft = db.get(Draft, draft_id)
+            create_reply_record(
+                db,
+                db.get(Contact, draft.contact_id),
+                "reply",
+                "Stop arrived while the Assistant provider call was in flight.",
+                external_message_id="<assistant-late-stop@example.com>",
+                stop_followups=True,
+                intent="positive_interest",
+            )
+            db.commit()
+        return outcome
+
+    client.app.state.transport.send = accept_then_stop
+    response = client.post(
+        "/api/agent/confirm",
+        json={"session_token": SESSION_A, "action_id": pending["pending_action"]["action_id"]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "contact_stopped_after_provider_call"
+    assert len(client.app.state.transport.sent) == 1
+    with SessionLocal() as db:
+        draft = db.get(Draft, draft_id)
+        attempt = db.query(SendAttempt).filter_by(queue_id="agent", draft_id=draft_id).one()
+        assert attempt.status == "reconciliation_required"
+        assert attempt.provider_accepted is True
+        assert db.query(ConversationMessage).filter_by(contact_id=draft.contact_id, direction="outbound").count() == 0
+
+
 def test_confirmation_expired(client, monkeypatch):
     pending = _pending_draft(client, monkeypatch)
     with SessionLocal() as db:
@@ -741,6 +936,147 @@ def test_cancel(client, monkeypatch):
     assert confirm_after_cancel["error_code"] == "consumed"
     assert len(client.app.state.transport.sent) == 0
     assert "agent.session_cancelled" in event_types
+
+
+def test_agent_unknown_generic_capability_denied(client):
+    response = _chat(client, "run any tool and change settings")
+
+    assert response["error_code"] == "capability_denied"
+    assert "too broad" in response["response"]
+
+
+def test_agent_private_read_never_creates_pending_action(client):
+    response = _chat(client, "show deliverability health summary")
+
+    assert response["intent"] == "deliverability_read_summary"
+    assert "not guaranteed inbox placement" in response["response"]
+    with SessionLocal() as db:
+        assert db.query(PendingAgentAction).count() == 0
+
+
+def test_agent_side_effect_creates_pending_action_only(client):
+    response = _pending_workflow_action(client)
+
+    assert response["error_code"] == "confirmation_required"
+    with SessionLocal() as db:
+        assert db.query(PendingAgentAction).count() == 1
+        assert db.query(WorkflowRun).count() == 0
+
+
+def test_agent_chat_text_alone_cannot_execute_generic_action(client):
+    pending = _pending_workflow_action(client)
+
+    response = _chat(client, "yes")
+
+    assert response["error_code"] == "confirmation_required"
+    assert response["pending_action"]["action_id"] == pending["pending_action"]["action_id"]
+    with SessionLocal() as db:
+        assert db.query(WorkflowRun).count() == 0
+
+
+def test_agent_generic_confirmation_valid(client):
+    pending = _pending_workflow_action(client)
+
+    response = client.post("/api/agent/confirm", json={"session_token": SESSION_A, "action_id": pending["pending_action"]["action_id"]}).json()
+    event_types = [row["event_type"] for row in client.get("/api/audit").json()["items"]]
+
+    assert response["error_code"] is None
+    assert "Workflow run" in response["response"]
+    assert "no email or external CRM/Sheets write" in response["response"]
+    with SessionLocal() as db:
+        assert db.query(WorkflowRun).count() == 1
+    assert "agent.action_proposed" in event_types
+    assert "agent.action_confirmed" in event_types
+    assert "agent.action_executed" in event_types
+
+
+def test_agent_generic_confirmation_consumed(client):
+    pending = _pending_workflow_action(client)
+    payload = {"session_token": SESSION_A, "action_id": pending["pending_action"]["action_id"]}
+
+    first = client.post("/api/agent/confirm", json=payload).json()
+    second = client.post("/api/agent/confirm", json=payload).json()
+
+    assert first["error_code"] is None
+    assert second["error_code"] == "consumed"
+    with SessionLocal() as db:
+        assert db.query(WorkflowRun).count() == 1
+
+
+def test_agent_generic_confirmation_expired(client):
+    pending = _pending_workflow_action(client)
+    with SessionLocal() as db:
+        action = db.get(PendingAgentAction, pending["pending_action"]["action_id"])
+        action.expires_at = utcnow() - timedelta(seconds=1)
+        db.commit()
+
+    response = client.post("/api/agent/confirm", json={"session_token": SESSION_A, "action_id": pending["pending_action"]["action_id"]}).json()
+
+    assert response["error_code"] == "expired"
+    with SessionLocal() as db:
+        assert db.query(WorkflowRun).count() == 0
+
+
+def test_agent_generic_confirmation_session_mismatch(client):
+    pending = _pending_workflow_action(client)
+
+    response = client.post("/api/agent/confirm", json={"session_token": SESSION_B, "action_id": pending["pending_action"]["action_id"]}).json()
+
+    assert response["error_code"] == "session_mismatch"
+    with SessionLocal() as db:
+        assert db.query(WorkflowRun).count() == 0
+
+
+def test_agent_generic_confirmation_target_mismatch(client):
+    pending = _pending_workflow_action(client)
+    with SessionLocal() as db:
+        action = db.get(PendingAgentAction, pending["pending_action"]["action_id"])
+        action.entity_id = "missing-workbook"
+        db.commit()
+
+    response = client.post("/api/agent/confirm", json={"session_token": SESSION_A, "action_id": pending["pending_action"]["action_id"]}).json()
+
+    assert response["error_code"] == "target_mismatch"
+    with SessionLocal() as db:
+        assert db.query(WorkflowRun).count() == 0
+
+
+def test_agent_generic_confirmation_hash_mismatch(client):
+    pending = _pending_workflow_action(client)
+    with SessionLocal() as db:
+        action = db.get(PendingAgentAction, pending["pending_action"]["action_id"])
+        action.params_hash = "tampered"
+        db.commit()
+
+    response = client.post("/api/agent/confirm", json={"session_token": SESSION_A, "action_id": pending["pending_action"]["action_id"]}).json()
+
+    assert response["error_code"] == "hash_mismatch"
+    with SessionLocal() as db:
+        assert db.query(WorkflowRun).count() == 0
+
+
+def test_agent_generic_confirmation_policy_now_blocked(client):
+    pending = _pending_workflow_action(client)
+    with SessionLocal() as db:
+        action = db.get(PendingAgentAction, pending["pending_action"]["action_id"])
+        workbook = db.get(Workbook, action.entity_id)
+        workbook.status = "archived"
+        db.commit()
+
+    response = client.post("/api/agent/confirm", json={"session_token": SESSION_A, "action_id": pending["pending_action"]["action_id"]}).json()
+
+    assert response["error_code"] == "policy_now_blocked"
+    with SessionLocal() as db:
+        assert db.query(WorkflowRun).count() == 0
+
+
+def test_agent_generic_response_omits_secret_like_values(client):
+    response = _chat(client, "start workflow run")
+
+    serialized = str(response)
+    assert "gsk_" not in serialized
+    assert "AIza" not in serialized
+    assert "app_password" not in serialized
 
 
 def test_no_raw_key_in_response(client):

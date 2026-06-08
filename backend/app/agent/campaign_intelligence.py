@@ -317,8 +317,8 @@ def build_campaign_snapshot(db: Session) -> str:
         .all()
     )
 
-    today_sends = db.query(SendAttempt).filter(SendAttempt.status == "success", SendAttempt.sent_at >= today_start).count()
-    week_sends = db.query(SendAttempt).filter(SendAttempt.status == "success", SendAttempt.sent_at >= week_start).count()
+    today_sends = db.query(SendAttempt).filter(SendAttempt.provider_accepted.is_(True), SendAttempt.sent_at >= today_start).count()
+    week_sends = db.query(SendAttempt).filter(SendAttempt.provider_accepted.is_(True), SendAttempt.sent_at >= week_start).count()
     pending_queue = db.query(SendQueue).filter(SendQueue.status == "pending").count()
     blocked_queue = db.query(SendQueue).filter(SendQueue.status == "blocked").count()
     blocked_rows = (

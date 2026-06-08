@@ -567,18 +567,43 @@ function renderInlineText(text: string) {
 }
 
 function PendingDraftCard({ action, onConfirm, onCancel, disabled, busyType }: { action: PendingAction; onConfirm: (action: PendingAction) => void; onCancel: (action: PendingAction) => void; disabled: boolean; busyType: "confirm" | "cancel" | null }) {
+  const isEmailDraft = action.capability === "email_send_draft" || action.to || action.subject || action.body;
   return (
     <div className="va-draft-card">
-      <div>
-        <strong>To:</strong> {action.to}
-      </div>
-      <div>
-        <strong>Subject:</strong> {action.subject}
-      </div>
-      <div className="va-draft-body">{action.body.slice(0, 300)}</div>
+      {isEmailDraft ? (
+        <>
+          <div>
+            <strong>To:</strong> {action.to}
+          </div>
+          <div>
+            <strong>Subject:</strong> {action.subject}
+          </div>
+          <div className="va-draft-body">{(action.body || "").slice(0, 300)}</div>
+        </>
+      ) : (
+        <>
+          <div>
+            <strong>Goal:</strong> {action.goal || action.confirmation_prompt}
+          </div>
+          <div>
+            <strong>Capability:</strong> {action.capability}
+          </div>
+          {action.evidence_summary && (
+            <div>
+              <strong>Evidence:</strong> {action.evidence_summary}
+            </div>
+          )}
+          {action.policy_result && (
+            <div>
+              <strong>Policy:</strong> {action.policy_result}
+            </div>
+          )}
+          {action.proposed_side_effect && <div className="va-draft-body">{action.proposed_side_effect}</div>}
+        </>
+      )}
       <div className="va-draft-actions">
         <button className="va-draft-confirm-btn" type="button" disabled={disabled} onClick={() => onConfirm(action)}>
-          {busyType === "confirm" ? "Confirming..." : "Confirm Send"}
+          {busyType === "confirm" ? "Confirming..." : isEmailDraft ? "Confirm Send" : "Confirm Action"}
         </button>
         <button className="va-draft-cancel-btn" type="button" disabled={disabled} onClick={() => onCancel(action)}>
           {busyType === "cancel" ? "Cancelling..." : "Cancel"}

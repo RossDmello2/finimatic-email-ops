@@ -21,7 +21,7 @@ TERM_TRANSLATIONS = {
     "draft_ready": "draft is ready",
     "approved": "draft approved",
     "queued": "email scheduled to send",
-    "sent": "email delivered",
+    "sent": "email accepted by the provider",
     "blocked": "blocked by a sending rule",
     "blocked_by_policy": "blocked by a sending rule",
     "draft_not_approved": "draft not approved yet",

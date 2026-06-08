@@ -5,7 +5,6 @@ import re
 from dataclasses import dataclass
 from datetime import timedelta
 
-from fastapi import HTTPException
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
@@ -23,7 +22,15 @@ from app.conversations.router import (
 from app.core.idempotency import sha256_key
 from app.core.time import iso, utcnow
 from app.db.models import Contact, ConversationMessage, Draft, Reply, SendAttempt, Suppression
-from app.send.smtp_adapter import GmailAdapter
+from app.send.governance import (
+    begin_provider_attempt,
+    persist_provider_outcome,
+    persist_provider_outcome_as_reconciliation,
+    provider_attempt_stop_fence_changed,
+)
+from app.send.outcomes import simulated_outcome
+from app.send.smtp_adapter import GmailAdapter, resolve_transport_metadata
+from app.send.truth import attempt_from_outcome, outcome_audit_payload
 from app.settings.service import get_bool, get_int, get_secret, get_value, sender_credentials_configured
 
 
@@ -77,7 +84,14 @@ class AutoReplyService:
         should_reply, mode, _reason = self._decision(contact, reply, db)
         return should_reply, mode
 
-    async def process_reply(self, contact_id: str, reply_id: str, db: Session) -> AutoReplyResult:
+    async def process_reply(
+        self,
+        contact_id: str,
+        reply_id: str,
+        db: Session,
+        *,
+        allow_autonomous: bool = True,
+    ) -> AutoReplyResult:
         contact = db.get(Contact, contact_id)
         reply = db.get(Reply, reply_id)
         if not contact or not reply:
@@ -92,7 +106,12 @@ class AutoReplyService:
                 payload={"contact_id": contact.id, "reason": reason},
             )
             return AutoReplyResult(action="skipped", reason=reason)
-        return await self.generate_and_maybe_send(contact.id, reply.id, mode, db)
+        return await self.generate_and_maybe_send(
+            contact.id,
+            reply.id,
+            mode if allow_autonomous else "propose",
+            db,
+        )
 
     async def generate_and_maybe_send(self, contact_id: str, reply_id: str, mode: str, db: Session) -> AutoReplyResult:
         contact = db.get(Contact, contact_id)
@@ -266,11 +285,51 @@ class AutoReplyService:
             raise ValueError("contact_not_found")
         block_reasons = self._send_block_reasons(db, contact, allow_proposed=True)
         if block_reasons:
+            if "DRY_RUN_ENABLED" in block_reasons:
+                idempotency_key = sha256_key("auto_reply", contact.id, self._reply_id_from_notes(draft.notes) or draft.id)
+                outcome = simulated_outcome(
+                    resolve_transport_metadata(db),
+                    error_code="dry_run",
+                    detail="Dry-run mode simulated the Auto-Reply approval; no provider was contacted",
+                ).with_context(idempotency_key=idempotency_key)
+                attempt = attempt_from_outcome(
+                    outcome,
+                    queue_id="auto_reply",
+                    contact_id=contact.id,
+                    draft_id=draft.id,
+                    idempotency_key=idempotency_key,
+                    sender_identity=get_value(db, "gmail_user"),
+                )
+                db.add(attempt)
+                db.flush()
+                outcome = outcome.with_context(attempt_id=attempt.id)
+                emit_event(
+                    db,
+                    "auto_reply.simulated",
+                    entity_type="draft",
+                    entity_id=draft.id,
+                    payload={"contact_id": contact.id, **outcome_audit_payload(outcome)},
+                )
+                return AutoReplyResult(
+                    action="simulated",
+                    mode="propose",
+                    draft_id=draft.id,
+                    reason="dry_run",
+                    subject=draft.subject,
+                )
             raise ValueError(",".join(block_reasons))
-        draft.approved = True
-        draft.approved_at = utcnow()
         result = await self._send_draft(db, contact, draft, source="auto_reply_approved", reply_id=self._reply_id_from_notes(draft.notes))
-        emit_event(db, "auto_reply.approved_and_sent", entity_type="draft", entity_id=draft.id, payload={"contact_id": contact.id, "message_id": result.message_id})
+        if result.action == "sent":
+            draft.approved = True
+            draft.approved_at = utcnow()
+        event_type = "auto_reply.approved_and_sent" if result.action == "sent" else "auto_reply.approved_not_sent"
+        emit_event(
+            db,
+            event_type,
+            entity_type="draft",
+            entity_id=draft.id,
+            payload={"contact_id": contact.id, "message_id": result.message_id, "action": result.action, "reason": result.reason},
+        )
         return result
 
     def reject_pending_draft(self, draft_id: str, db: Session) -> Draft:
@@ -372,7 +431,13 @@ class AutoReplyService:
         return values or SAFE_DEFAULT_INTENTS
 
     def _global_mode(self, db: Session) -> str:
-        return "autonomous" if get_value(db, "auto_reply_mode", "propose") == "autonomous" else "propose"
+        if (
+            get_value(db, "auto_reply_mode", "propose") == "autonomous"
+            and get_bool(db, "auto_reply_autonomous_authorized")
+            and not get_bool(db, "auto_reply_kill_switch")
+        ):
+            return "autonomous"
+        return "propose"
 
     def _scope_messages_after_latest_fresh_outbound(self, messages: list[ConversationMessage], reply: Reply) -> list[ConversationMessage]:
         reply_time = self._aware_time(reply.received_at)
@@ -422,7 +487,14 @@ class AutoReplyService:
                 return subject if subject.lower().startswith("re:") else f"Re: {subject}"
         return "Re: conversation"
 
-    def _send_block_reasons(self, db: Session, contact: Contact, *, allow_proposed: bool = False) -> list[str]:
+    def _send_block_reasons(
+        self,
+        db: Session,
+        contact: Contact,
+        *,
+        allow_proposed: bool = False,
+        require_autonomous: bool = False,
+    ) -> list[str]:
         reasons = _engaged_send_block_reasons(db, contact)
         if not get_bool(db, "canary_verified"):
             reasons.append("CANARY_NOT_VERIFIED")
@@ -430,6 +502,15 @@ class AutoReplyService:
             reasons.append("DRY_RUN_ENABLED")
         if not sender_credentials_configured(db):
             reasons.append("SENDER_NOT_CONFIGURED")
+        if require_autonomous:
+            if not get_bool(db, "auto_reply_enabled"):
+                reasons.append("AUTO_REPLY_DISABLED")
+            if get_value(db, "auto_reply_mode", "propose") != "autonomous":
+                reasons.append("AUTO_REPLY_NOT_AUTONOMOUS")
+            if not get_bool(db, "auto_reply_autonomous_authorized"):
+                reasons.append("AUTONOMOUS_NOT_AUTHORIZED")
+            if get_bool(db, "auto_reply_kill_switch"):
+                reasons.append("AUTO_REPLY_KILLED")
         if allow_proposed and "RECIPIENT_REPLIED" in reasons:
             reasons.remove("RECIPIENT_REPLIED")
         return sorted(set(reasons))
@@ -469,64 +550,195 @@ class AutoReplyService:
         )
 
     async def _send_draft(self, db: Session, contact: Contact, draft: Draft, *, source: str, reply_id: str | None) -> AutoReplyResult:
+        require_autonomous = source == "auto_reply"
+        kill_generation = get_int(db, "auto_reply_kill_generation")
+        block_reasons = self._send_block_reasons(
+            db,
+            contact,
+            allow_proposed=source == "auto_reply_approved",
+            require_autonomous=require_autonomous,
+        )
+        if block_reasons:
+            return AutoReplyResult(
+                action="blocked",
+                mode="autonomous",
+                draft_id=draft.id,
+                reason=",".join(block_reasons),
+                subject=draft.subject,
+            )
         user = get_value(db, "gmail_user")
         password = get_secret(db, "gmail_app_password")
         idempotency_key = sha256_key("auto_reply", contact.id, reply_id or draft.id)
-        existing = db.query(SendAttempt).filter(SendAttempt.idempotency_key == idempotency_key, SendAttempt.status == "success").first()
+        existing = (
+            db.query(SendAttempt)
+            .filter(SendAttempt.idempotency_key == idempotency_key, SendAttempt.provider_accepted.is_(True))
+            .first()
+        )
         if existing:
             return AutoReplyResult(action="skipped", mode="autonomous", reason="duplicate", message_id=existing.provider_msg_id, subject=draft.subject)
-        sent_at = utcnow()
-        result = await GmailAdapter.from_settings(db).send_message(contact.email, draft.subject, draft.body, user, password)
-        if result.status != "success":
-            db.add(
-                SendAttempt(
-                    queue_id="auto_reply",
-                    contact_id=contact.id,
-                    draft_id=draft.id,
-                    idempotency_key=idempotency_key,
-                    status="failed",
-                    sender_identity=user,
-                    error_code=result.error_code,
-                    error_detail=result.error_detail,
-                )
-            )
-            emit_event(db, "auto_reply.failed", entity_type="contact", entity_id=contact.id, payload={"draft_id": draft.id, "error_code": result.error_code})
-            return AutoReplyResult(action="failed", mode="autonomous", draft_id=draft.id, reason=result.error_code, subject=draft.subject)
-        db.add(
-            SendAttempt(
-                queue_id="auto_reply",
-                contact_id=contact.id,
-                draft_id=draft.id,
-                idempotency_key=idempotency_key,
-                provider_msg_id=result.provider_msg_id,
-                smtp_response=result.smtp_response,
-                status="success",
-                sender_identity=user,
-                sent_at=sent_at,
-            )
+        adapter = GmailAdapter.from_settings(db)
+        attempt, attempt_state = begin_provider_attempt(
+            db,
+            queue_id="auto_reply",
+            contact_id=contact.id,
+            draft_id=draft.id,
+            idempotency_key=idempotency_key,
+            sender_identity=user,
+            configured_transport=adapter.resolution.configured_transport,
+            effective_transport=adapter.resolution.effective_transport,
+            transport_source=adapter.resolution.transport_source,
+            entity_type="contact",
+            entity_id=contact.id,
+            audit_source=source,
         )
-        message = db.query(ConversationMessage).filter(ConversationMessage.external_message_id == f"draft:{draft.id}").first()
-        if message:
-            message.source = source
-            message.auto_sent = True
-            message.external_message_id = result.provider_msg_id
-            message.occurred_at = sent_at
-        else:
-            db.add(
-                ConversationMessage(
-                    contact_id=contact.id,
-                    direction="outbound",
-                    subject=draft.subject,
-                    body=draft.body,
-                    source=source,
-                    auto_sent=True,
-                    external_message_id=result.provider_msg_id,
-                    occurred_at=sent_at,
-                )
+        if attempt_state == "provider_accepted":
+            return AutoReplyResult(action="skipped", mode="autonomous", reason="duplicate", message_id=attempt.provider_msg_id, subject=draft.subject)
+        if attempt_state == "reconciliation_required":
+            return AutoReplyResult(action="reconciliation_required", mode="autonomous", draft_id=draft.id, reason="existing_ambiguous_attempt", subject=draft.subject)
+
+        db.expire_all()
+        contact = db.get(Contact, contact.id)
+        block_reasons = self._send_block_reasons(
+            db,
+            contact,
+            allow_proposed=source == "auto_reply_approved",
+            require_autonomous=require_autonomous,
+        )
+        if provider_attempt_stop_fence_changed(db, attempt.id):
+            block_reasons.append("CONTACT_SEND_STOPPED")
+        if get_int(db, "auto_reply_kill_generation") != kill_generation:
+            block_reasons.append("AUTO_REPLY_KILLED")
+        if block_reasons:
+            outcome = simulated_outcome(
+                adapter.resolution,
+                error_code="policy_changed_before_provider_call",
+                detail="Policy changed after confirmation; provider execution was blocked",
+                blocked=True,
+            ).with_context(idempotency_key=idempotency_key, attempt_id=attempt.id)
+            persist_provider_outcome(
+                db,
+                attempt_id=attempt.id,
+                outcome=outcome,
+                entity_type="contact",
+                entity_id=contact.id,
+                audit_source=source,
             )
-        contact.status = "conversation_active"
-        emit_event(db, "auto_reply.sent", entity_type="contact", entity_id=contact.id, payload={"draft_id": draft.id, "subject": draft.subject, "message_id": result.provider_msg_id})
-        return AutoReplyResult(action="sent", mode="autonomous", draft_id=draft.id, message_id=result.provider_msg_id, subject=draft.subject)
+            emit_event(
+                db,
+                "auto_reply.failed",
+                entity_type="contact",
+                entity_id=contact.id,
+                payload={"draft_id": draft.id, "reasons": block_reasons, **outcome_audit_payload(outcome)},
+            )
+            db.commit()
+            return AutoReplyResult(
+                action="blocked",
+                mode="autonomous",
+                draft_id=draft.id,
+                reason=",".join(block_reasons),
+                subject=draft.subject,
+            )
+        sent_at = utcnow()
+        outcome = (
+            await adapter.send_message(contact.email, draft.subject, draft.body, user, password)
+        ).with_context(idempotency_key=idempotency_key, attempt_id=attempt.id)
+        db.expire_all()
+        late_error = None
+        if outcome.provider_accepted and provider_attempt_stop_fence_changed(db, attempt.id):
+            late_error = "contact_stopped_after_provider_call"
+        elif outcome.provider_accepted and get_int(db, "auto_reply_kill_generation") != kill_generation:
+            late_error = "auto_reply_killed_after_provider_call"
+        elif outcome.provider_accepted and require_autonomous and (
+            get_value(db, "auto_reply_mode", "propose") != "autonomous"
+            or not get_bool(db, "auto_reply_autonomous_authorized")
+            or get_bool(db, "auto_reply_kill_switch")
+        ):
+            late_error = "auto_reply_killed_after_provider_call"
+        if late_error:
+            persist_provider_outcome_as_reconciliation(
+                db,
+                attempt_id=attempt.id,
+                outcome=outcome,
+                entity_type="contact",
+                entity_id=contact.id,
+                audit_source=source,
+                error_code=late_error,
+                error_detail="Send authority changed while the provider call was in flight",
+            )
+            return AutoReplyResult(
+                action="reconciliation_required",
+                mode="autonomous" if require_autonomous else "propose",
+                draft_id=draft.id,
+                message_id=outcome.provider_message_id,
+                reason=late_error,
+                subject=draft.subject,
+            )
+        def project_auto_reply(session: Session, _attempt: SendAttempt) -> None:
+            if not outcome.provider_accepted:
+                emit_event(
+                    session,
+                    "auto_reply.failed",
+                    entity_type="contact",
+                    entity_id=contact.id,
+                    payload={"draft_id": draft.id, **outcome_audit_payload(outcome)},
+                )
+                return
+            message = session.query(ConversationMessage).filter(
+                ConversationMessage.external_message_id == f"draft:{draft.id}"
+            ).first()
+            if message:
+                message.source = source
+                message.auto_sent = True
+                message.external_message_id = outcome.provider_message_id or outcome.tracking_message_id
+                message.occurred_at = sent_at
+            else:
+                session.add(
+                    ConversationMessage(
+                        contact_id=contact.id,
+                        direction="outbound",
+                        subject=draft.subject,
+                        body=draft.body,
+                        source=source,
+                        auto_sent=True,
+                        external_message_id=outcome.provider_message_id or outcome.tracking_message_id,
+                        occurred_at=sent_at,
+                    )
+                )
+            contact.status = "conversation_active"
+            emit_event(
+                session,
+                "auto_reply.sent",
+                entity_type="contact",
+                entity_id=contact.id,
+                payload={"draft_id": draft.id, "subject": draft.subject, **outcome_audit_payload(outcome)},
+            )
+
+        attempt, persisted = persist_provider_outcome(
+            db,
+            attempt_id=attempt.id,
+            outcome=outcome,
+            entity_type="contact",
+            entity_id=contact.id,
+            audit_source=source,
+            project=project_auto_reply,
+        )
+        if not persisted:
+            return AutoReplyResult(
+                action="reconciliation_required",
+                mode="autonomous",
+                draft_id=draft.id,
+                reason="post_provider_commit_failed",
+                subject=draft.subject,
+            )
+        if not outcome.provider_accepted:
+            return AutoReplyResult(
+                action=outcome.attempt_status,
+                mode="autonomous",
+                draft_id=draft.id,
+                reason=outcome.error_code,
+                subject=draft.subject,
+            )
+        return AutoReplyResult(action="sent", mode="autonomous", draft_id=draft.id, message_id=outcome.provider_message_id, subject=draft.subject)
 
     def _existing_pending_proposal(self, db: Session, reply_id: str) -> Draft | None:
         return (
@@ -551,7 +763,11 @@ class AutoReplyService:
     def _repeats_previous_outbound(self, db: Session, contact_id: str, body: str) -> bool:
         previous = (
             db.query(ConversationMessage)
-            .filter(ConversationMessage.contact_id == contact_id, ConversationMessage.direction == "outbound")
+            .filter(
+                ConversationMessage.contact_id == contact_id,
+                ConversationMessage.direction == "outbound",
+                ConversationMessage.source != "auto_reply_proposed",
+            )
             .order_by(ConversationMessage.occurred_at.desc(), ConversationMessage.created_at.desc())
             .first()
         )

@@ -122,7 +122,7 @@ def parse_structured_content(content: str, default_source: str) -> list[dict]:
         return []
     raw_headers = [cell.strip() for cell in rows[0]]
     headers = [normalize_header(cell) for cell in raw_headers]
-    has_header = "email" in headers or any(header in HEADER_ALIASES.values() for header in headers)
+    has_header = "email" in headers
     parsed: list[dict] = []
     if has_header:
         for cells in rows[1:]:

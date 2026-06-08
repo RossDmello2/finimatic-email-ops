@@ -16,7 +16,33 @@ services:
         sync: false
       - key: FRONTEND_URL
         value: https://finimatic-frontend.vercel.app/
+      - key: FINIMATIC_ENVIRONMENT
+        value: production
+      - key: FINIMATIC_HOSTING_MODE
+        value: render_free
+      - key: FINIMATIC_AUTH_COOKIE_SECURE
+        value: "1"
+      - key: FINIMATIC_AUTH_CLIENT_ID
+        sync: false
+      - key: FINIMATIC_AUTH_CLIENT_SECRET
+        sync: false
+      - key: FINIMATIC_AUTH_AUTHORIZATION_URL
+        sync: false
+      - key: FINIMATIC_AUTH_TOKEN_URL
+        sync: false
+      - key: FINIMATIC_AUTH_REDIRECT_URI
+        value: https://finimatic-frontend.vercel.app/api/auth/callback
+      - key: SUPABASE_AUTH_ISSUER
+        sync: false
+      - key: SUPABASE_AUTH_AUDIENCE
+        value: authenticated
+      - key: SUPABASE_AUTH_JWKS_URL
+        sync: false
+      - key: FINIMATIC_AUTH_OPERATOR_SUBJECTS
+        sync: false
+      - key: FINIMATIC_AUTH_ADMIN_SUBJECTS
+        sync: false
       - key: GMAIL_OAUTH_REDIRECT_URI
-        value: https://finimatic-backend.onrender.com/api/settings/gmail-api/oauth/callback
+        value: https://finimatic-frontend.vercel.app/api/settings/gmail-api/oauth/callback
       - key: FINIMATIC_DISABLE_SCHEDULER
-        value: "0"
+        value: "1"

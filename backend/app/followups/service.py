@@ -13,7 +13,9 @@ from app.ai.prompts import custom_field_context, sender_profile_from_settings
 from app.contacts.utils import is_domain_blocked, resolve_tokens
 from app.core.time import utcnow
 from app.db.models import Contact, Draft, FollowUpSequence, Reply, Suppression
+from app.send.policy import prequeue_block_reasons
 from app.send.queue_worker import create_queue_entry
+from app.send.sequence import campaign_context_for_draft, campaign_step_definition, campaign_step_error
 from app.settings.service import get_int, get_key_list, get_value
 
 FOLLOWUP_PLACEHOLDER_RE = re.compile(r"\[[^\]]+\]")
@@ -60,7 +62,11 @@ def followup_to_dict(row: FollowUpSequence, db: Session | None = None) -> dict:
     }
 
 
-def stop_reason(db: Session, contact: Contact) -> str | None:
+def stop_reason(db: Session, contact: Contact, row: FollowUpSequence | None = None) -> str | None:
+    if row is not None:
+        context = campaign_context_for_draft(db, row.pending_draft_id or row.draft_id)
+        if context and context[0].status != "active":
+            return "CAMPAIGN_NOT_ACTIVE"
     if contact.status == "replied":
         return "RECIPIENT_REPLIED"
     if contact.status == "unsubscribed":
@@ -98,7 +104,19 @@ def process_due_followups(db: Session) -> dict:
     skipped = 0
     for row in due:
         contact = db.get(Contact, row.contact_id)
-        reason = stop_reason(db, contact)
+        if contact is None:
+            row.status = "stopped"
+            row.stop_reason = "CONTACT_NOT_FOUND"
+            emit_event(
+                db,
+                "followup.stopped",
+                entity_type="follow_up_sequence",
+                entity_id=row.id,
+                payload={"reason": "CONTACT_NOT_FOUND"},
+            )
+            stopped += 1
+            continue
+        reason = stop_reason(db, contact, row)
         if reason:
             row.status = "stopped"
             row.stop_reason = reason
@@ -106,7 +124,20 @@ def process_due_followups(db: Session) -> dict:
             emit_event(db, "followup.stopped", entity_type="follow_up_sequence", entity_id=row.id, payload={"reason": reason})
             stopped += 1
         else:
-            draft = _make_followup_draft(db, contact, row.sequence_num)
+            try:
+                draft = _make_followup_draft(db, contact, row.sequence_num, source_draft_id=row.draft_id)
+            except ValueError as exc:
+                row.status = "stopped"
+                row.stop_reason = str(exc)
+                emit_event(
+                    db,
+                    "followup.stopped",
+                    entity_type="follow_up_sequence",
+                    entity_id=row.id,
+                    payload={"reason": str(exc)},
+                )
+                stopped += 1
+                continue
             row.draft_id = draft.id
             row.pending_draft_id = draft.id
             row.status = "pending_approval"
@@ -127,7 +158,39 @@ def _template_for_sequence(db: Session, sequence_num: int) -> str:
     return get_value(db, template_key)
 
 
-def _make_followup_draft(db: Session, contact: Contact, sequence_num: int) -> Draft:
+def _make_followup_draft(
+    db: Session,
+    contact: Contact,
+    sequence_num: int,
+    *,
+    source_draft_id: str | None = None,
+) -> Draft:
+    campaign_context = campaign_context_for_draft(db, source_draft_id)
+    if campaign_context:
+        campaign, previous_step = campaign_context
+        if campaign.status != "active":
+            raise ValueError("CAMPAIGN_NOT_ACTIVE")
+        if sequence_num != previous_step + 1:
+            raise ValueError("CAMPAIGN_SEQUENCE_MISMATCH")
+        error = campaign_step_error(campaign, sequence_num)
+        if error:
+            raise ValueError(error)
+        step = campaign_step_definition(campaign, sequence_num)
+        draft = Draft(
+            contact_id=contact.id,
+            subject=resolve_tokens(str(step["subject"]), contact),
+            body=resolve_tokens(str(step["body"]), contact),
+            ai_provider="campaign_plan",
+            ai_model=None,
+            warnings=json.dumps([]),
+            notes=f"campaign:{campaign.id}:step{sequence_num}",
+            approved=False,
+            approved_at=None,
+        )
+        db.add(draft)
+        db.flush()
+        return draft
+
     template = _template_for_sequence(db, sequence_num)
     subject = f"Following up with {contact.creator_name or contact.business_name or 'you'}"
     body = template
@@ -270,7 +333,7 @@ def approve_followup_draft(db: Session, sequence_id: str, *, immediate: bool = F
     if draft.approved:
         raise ValueError("draft_already_approved")
     contact = db.get(Contact, row.contact_id)
-    block_reasons = _followup_approval_block_reasons(db, contact)
+    block_reasons = _followup_approval_block_reasons(db, contact, row)
     if block_reasons:
         row.status = "stopped"
         row.stop_reason = block_reasons[0]
@@ -288,7 +351,7 @@ def approve_followup_draft(db: Session, sequence_id: str, *, immediate: bool = F
     queue = create_queue_entry(db, row.contact_id, draft.id, row.sequence_num)
     if immediate and queue.status in {"pending", "skipped"}:
         queue.scheduled_at = utcnow()
-    row.status = "dispatched"
+    row.status = "queued"
     row.draft_id = draft.id
     emit_event(
         db,
@@ -301,10 +364,18 @@ def approve_followup_draft(db: Session, sequence_id: str, *, immediate: bool = F
     return {"status": "queued", "queue_id": queue.id}
 
 
-def _followup_approval_block_reasons(db: Session, contact: Contact | None) -> list[str]:
+def _followup_approval_block_reasons(
+    db: Session,
+    contact: Contact | None,
+    row: FollowUpSequence | None = None,
+) -> list[str]:
     if not contact:
         return ["CONTACT_NOT_FOUND"]
     reasons: list[str] = []
+    if row is not None:
+        context = campaign_context_for_draft(db, row.pending_draft_id or row.draft_id)
+        if context and context[0].status != "active":
+            reasons.append("CAMPAIGN_NOT_ACTIVE")
     if contact.deleted_at is not None:
         reasons.append("CONTACT_DELETED")
     if db.query(Suppression).filter(Suppression.email == contact.email).first() or is_domain_blocked(db, contact.email):
@@ -317,4 +388,5 @@ def _followup_approval_block_reasons(db: Session, contact: Contact | None) -> li
         reasons.append("RECIPIENT_MANUALLY_PAUSED")
     if db.query(Reply).filter(Reply.contact_id == contact.id, Reply.archived_at.is_(None), Reply.classified_as.in_(["reply", "unsubscribe", "bounce"])).first():
         reasons.append("RECIPIENT_REPLIED")
+    reasons.extend(prequeue_block_reasons(contact, db))
     return reasons

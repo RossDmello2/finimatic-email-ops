@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit.service import emit_event
 from app.ai.gateway import GROQ_MODEL_DEFAULT
 from app.ai.groq_pool import GroqKeyPool
+from app.core.idempotency import sha256_key
 from app.core.time import utcnow
 from app.db.models import Contact, ConversationMessage, Draft, FollowUpSequence, Reply, SendAttempt, Suppression
+from app.send.stop_service import stop_contact_send_work
+from app.send.sequence import provider_acceptance_evidence_present
 from app.settings.service import get_key_list, get_value
 
 
@@ -35,6 +40,13 @@ STOP_REASON_BY_CLASSIFICATION = {
 }
 
 
+def _reply_dedupe_key(contact_id: str, external_message_id: str | None) -> str | None:
+    normalized = (external_message_id or "").strip().lower()
+    if not normalized:
+        return None
+    return sha256_key("reply", contact_id, normalized)
+
+
 def reply_to_dict(row: Reply, contact_email: str | None = None) -> dict:
     return {
         "id": row.id,
@@ -50,19 +62,8 @@ def reply_to_dict(row: Reply, contact_email: str | None = None) -> dict:
 
 
 def stop_followups_for_contact(db: Session, contact_id: str, reason: str) -> int:
-    rows = (
-        db.query(FollowUpSequence)
-        .filter(
-            FollowUpSequence.contact_id == contact_id,
-            FollowUpSequence.status.in_(["due", "skipped", "pending_approval"]),
-        )
-        .all()
-    )
-    for row in rows:
-        row.status = "stopped"
-        row.stop_reason = reason
-        emit_event(db, "followup.stopped", entity_type="follow_up_sequence", entity_id=row.id, payload={"reason": reason})
-    return len(rows)
+    affected = stop_contact_send_work(db, contact_id, reason)
+    return len(affected["followup_ids"])
 
 
 def create_reply_record(
@@ -78,9 +79,18 @@ def create_reply_record(
     received_at=None,
 ) -> tuple[Reply, bool]:
     if external_message_id:
+        normalized_message_id = external_message_id.strip().lower()
         existing = (
             db.query(Reply)
-            .filter(Reply.contact_id == contact.id, Reply.external_message_id == external_message_id)
+            .filter(
+                Reply.contact_id == contact.id,
+                func.lower(func.trim(Reply.external_message_id)) == normalized_message_id,
+            )
+            .order_by(
+                Reply.dedupe_key.is_not(None).desc(),
+                Reply.created_at.asc(),
+                Reply.id.asc(),
+            )
             .first()
         )
     else:
@@ -90,6 +100,8 @@ def create_reply_record(
             .first()
         )
     if existing:
+        if existing.dedupe_key is None:
+            existing.dedupe_key = _reply_dedupe_key(contact.id, external_message_id)
         if received_at is not None:
             existing.received_at = received_at
         refined_intent = _normalize_intent(intent)
@@ -98,6 +110,17 @@ def create_reply_record(
             _apply_intent_routing(db, contact, existing, refined_intent)
             emit_event(db, "reply.classified", entity_type="reply", entity_id=existing.id, payload={"classified_as": existing.classified_as, "intent": refined_intent})
         _refresh_reply_body(db, existing, raw_summary, subject)
+        should_suppress = _should_suppress_reply(existing.classified_as, existing.intent, existing.raw_summary)
+        suppression_exists = db.query(Suppression).filter_by(email=contact.email.strip().lower()).first()
+        if should_suppress and suppression_exists is None:
+            _ensure_suppression(
+                db,
+                contact,
+                "unsubscribe"
+                if existing.intent == "unsubscribe" or existing.classified_as == "unsubscribe"
+                else "hostile_or_stop_request",
+            )
+            stop_contact_send_work(db, contact.id, "RECIPIENT_SUPPRESSED")
         return existing, False
 
     resolved_intent = _normalize_intent(intent) or _intent_from_classification(classified_as)
@@ -111,22 +134,35 @@ def create_reply_record(
         intent=resolved_intent,
         raw_summary=raw_summary,
         external_message_id=external_message_id,
+        dedupe_key=_reply_dedupe_key(contact.id, external_message_id),
     )
-    db.add(row)
-    db.flush()
+    try:
+        with db.begin_nested():
+            db.add(row)
+            db.flush()
+    except IntegrityError:
+        existing = (
+            db.query(Reply)
+            .filter(Reply.dedupe_key == _reply_dedupe_key(contact.id, external_message_id))
+            .first()
+        )
+        if existing is None:
+            raise
+        _refresh_reply_body(db, existing, raw_summary, subject)
+        return existing, False
     _add_inbound_conversation_message(db, contact, row, subject)
     db.flush()
 
     next_status = STATUS_BY_CLASSIFICATION.get(classified_as)
     if next_status:
         contact.status = next_status
-        if stop_followups:
+        if stop_followups or classified_as in {"unsubscribe", "bounce"}:
             reason = STOP_REASON_BY_CLASSIFICATION[classified_as]
-            stop_followups_for_contact(db, contact.id, reason)
+            stop_contact_send_work(db, contact.id, reason)
     _apply_intent_routing(db, contact, row, resolved_intent)
     if _should_suppress_reply(classified_as, resolved_intent, raw_summary):
         _ensure_suppression(db, contact, "unsubscribe" if resolved_intent == "unsubscribe" or classified_as == "unsubscribe" else "hostile_or_stop_request")
-        stop_followups_for_contact(db, contact.id, "RECIPIENT_SUPPRESSED")
+        stop_contact_send_work(db, contact.id, "RECIPIENT_SUPPRESSED")
 
     emit_event(db, "reply.received", entity_type="contact", entity_id=contact.id, payload={"classified_as": classified_as, "intent": resolved_intent})
     emit_event(db, "reply.classified", entity_type="reply", entity_id=row.id, payload={"classified_as": classified_as, "intent": resolved_intent})
@@ -241,15 +277,7 @@ def _apply_intent_routing(db: Session, contact: Contact, row: Reply, intent: str
         emit_event(db, "reply.escalated", entity_type="contact", entity_id=contact.id, payload={"intent": intent, "contact_id": contact.id})
     elif intent == "negative_no":
         contact.status = "follow_up_stopped"
-        stopped = (
-            db.query(FollowUpSequence)
-            .filter(FollowUpSequence.contact_id == contact.id, FollowUpSequence.status == "due")
-            .all()
-        )
-        for item in stopped:
-            item.status = "stopped"
-            item.stop_reason = "RECIPIENT_NEGATIVE_NO"
-            emit_event(db, "followup.stopped", entity_type="follow_up_sequence", entity_id=item.id, payload={"reason": "RECIPIENT_NEGATIVE_NO", "intent": intent})
+        stop_contact_send_work(db, contact.id, "RECIPIENT_NEGATIVE_NO")
 
 
 def _contains_unsubscribe_cue(text: str) -> bool:
@@ -342,9 +370,14 @@ def refresh_contact_status_after_reply_change(db: Session, contact: Contact) -> 
         contact.status = STATUS_BY_CLASSIFICATION[active.classified_as]
         return
 
-    if contact.status not in set(STATUS_BY_CLASSIFICATION.values()):
+    if contact.status not in {*STATUS_BY_CLASSIFICATION.values(), "suppressed"}:
         return
-    if db.query(SendAttempt).filter(SendAttempt.contact_id == contact.id, SendAttempt.status == "success").first():
+    accepted_attempts = (
+        db.query(SendAttempt)
+        .filter(SendAttempt.contact_id == contact.id, SendAttempt.provider_accepted.is_(True))
+        .all()
+    )
+    if any(provider_acceptance_evidence_present(attempt) for attempt in accepted_attempts):
         contact.status = "sent"
     elif db.query(Draft).filter(Draft.contact_id == contact.id).first():
         contact.status = "draft_ready"

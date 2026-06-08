@@ -6,7 +6,7 @@ param(
     [string]$FrontendUrl,
 
     [Parameter(Mandatory = $false)]
-    [string]$SupabaseUrl = "https://hpamfbjawuyztqowtrth.supabase.co"
+    [string]$SupabaseUrl = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,7 +34,7 @@ function Add-Check {
 $Results = @()
 $Backend = Normalize-Origin $BackendUrl
 $Frontend = if ($FrontendUrl) { Normalize-Origin $FrontendUrl } else { "" }
-$Supabase = Normalize-Origin $SupabaseUrl
+$Supabase = if ($SupabaseUrl) { Normalize-Origin $SupabaseUrl } else { "" }
 
 try {
     $health = Invoke-RestMethod -Method Get -Uri "$Backend/api/health" -TimeoutSec 20
@@ -44,12 +44,15 @@ try {
 }
 
 try {
-    $settingsResponse = Invoke-WebRequest -Method Get -Uri "$Backend/api/settings" -TimeoutSec 20
-    $settingsText = [string]$settingsResponse.Content
-    $containsSecretPrefix = $settingsText -match "gsk_|AIza|rnd_|vcp_|gAAAA"
-    Add-Check "settings_no_raw_secret_prefixes" (-not $containsSecretPrefix) "GET /api/settings completed with HTTP $($settingsResponse.StatusCode)"
+    $settingsResponse = Invoke-WebRequest -Method Get -Uri "$Backend/api/settings" -TimeoutSec 20 -SkipHttpErrorCheck
+    $settingsProtected = $settingsResponse.StatusCode -in @(401, 403)
+    Add-Check "settings_requires_authentication" $settingsProtected "GET /api/settings returned HTTP $($settingsResponse.StatusCode)"
 } catch {
-    Add-Check "settings_no_raw_secret_prefixes" $false $_.Exception.Message
+    $status = $null
+    if ($_.Exception.Response) {
+        $status = [int]$_.Exception.Response.StatusCode
+    }
+    Add-Check "settings_requires_authentication" ($status -in @(401, 403)) "GET /api/settings returned HTTP $status"
 }
 
 if ($Frontend) {
@@ -62,30 +65,23 @@ if ($Frontend) {
     }
 
     try {
-        $cors = Invoke-WebRequest -Method Options -Uri "$Backend/api/health" -Headers @{
-            Origin = $Frontend
-            "Access-Control-Request-Method" = "GET"
-        } -TimeoutSec 20
-        $allowOrigin = $cors.Headers["Access-Control-Allow-Origin"]
-        Add-Check "cors_allows_frontend" ($allowOrigin -eq $Frontend) "Access-Control-Allow-Origin=$allowOrigin"
+        $proxiedHealth = Invoke-RestMethod -Method Get -Uri "$Frontend/api/health" -TimeoutSec 20
+        Add-Check "frontend_api_proxy" ($proxiedHealth.status -eq "ok") "GET $Frontend/api/health returned status=$($proxiedHealth.status)"
     } catch {
-        Add-Check "cors_allows_frontend" $false $_.Exception.Message
+        Add-Check "frontend_api_proxy" $false $_.Exception.Message
     }
 } else {
     Add-Check "frontend_loads" $false "Skipped: pass -FrontendUrl after Vercel deploy"
-    Add-Check "cors_allows_frontend" $false "Skipped: pass -FrontendUrl after Vercel deploy"
+    Add-Check "frontend_api_proxy" $false "Skipped: pass -FrontendUrl after Vercel deploy"
 }
 
-try {
-    $supabaseRest = Invoke-WebRequest -Method Get -Uri "$Supabase/rest/v1/" -TimeoutSec 20
-    Add-Check "supabase_api_reachable" (($supabaseRest.StatusCode -ge 200) -and ($supabaseRest.StatusCode -lt 500)) "GET $Supabase/rest/v1/ returned HTTP $($supabaseRest.StatusCode)"
-} catch {
-    $status = $null
-    if ($_.Exception.Response) {
-        $status = [int]$_.Exception.Response.StatusCode
+if ($Supabase) {
+    try {
+        $supabaseRest = Invoke-WebRequest -Method Get -Uri "$Supabase/rest/v1/" -TimeoutSec 20 -SkipHttpErrorCheck
+        Add-Check "supabase_api_reachable" ($supabaseRest.StatusCode -lt 500) "GET $Supabase/rest/v1/ returned HTTP $($supabaseRest.StatusCode)"
+    } catch {
+        Add-Check "supabase_api_reachable" $false $_.Exception.Message
     }
-    $reachable = $status -in @(401, 403, 404)
-    Add-Check "supabase_api_reachable" $reachable "GET $Supabase/rest/v1/ returned HTTP $status"
 }
 
 $Results | Format-Table -AutoSize

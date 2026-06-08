@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -15,7 +16,15 @@ from app.agent.intent import IntentAgent
 from app.agent.layman_formatter import build_contact_name_map, format_for_layman
 from app.agent.memory import get_or_create_session, update_session
 from app.agent.orchestrator import OrchestratorAgent
-from app.agent.pending import cancel_pending_action, create_pending_action, validate_pending_action
+from app.agent.pending import (
+    cancel_generic_pending_actions,
+    cancel_pending_action,
+    claim_generic_pending_action,
+    create_generic_pending_action,
+    create_pending_action,
+    validate_generic_pending_action,
+    validate_pending_action,
+)
 from app.agent.reasoning import ReasoningAgent
 from app.agent.response import ResponseAgent
 from app.agent.schemas import AgentCancelRequest, AgentChatRequest, AgentChatResponse, AgentConfirmRequest, AgentDraft, EvidenceEnvelope, IntentDecision, PendingEmailAction, ToolPlan
@@ -23,7 +32,10 @@ from app.agent.slot import SlotAgent
 from app.agent.tools import AgenticToolExecutor, sanitize_text
 from app.agent.verifier import VerifierAgent
 from app.audit.service import emit_event
-from app.db.models import Contact, ConversationMessage, Draft, PendingEmailActionRow, Reply
+from app.db.models import Contact, ConversationMessage, Draft, PendingAgentAction, PendingEmailActionRow, Reply, Workbook, WorkbookColumn, WorkbookRow
+from app.deliverability.service import deliverability_summary
+from app.integrations.service import create_contact_sync_preview, preview_to_dict
+from app.workflows.service import ensure_default_workbook, run_to_dict, run_workflow
 
 MAX_AGENT_MESSAGE_CHARS = 4000
 TAIL_PRESERVE_CHARS = 1800
@@ -107,6 +119,11 @@ class AgentService:
             emit_event(db, "agent.acknowledgement", entity_type="agent_session", entity_id=session.id, payload={"message": safe_message[:40]})
             db.commit()
             return AgentChatResponse(response=formatted, source="Assistant Help", intent="acknowledgement", channel="awareness")
+
+        phase7_response = self._phase7_direct_response(safe_message, session, contact_map, turn_history, db)
+        if phase7_response:
+            db.commit()
+            return phase7_response
 
         if forced_channel:
             channel_decision = ChannelDecision(channel=forced_channel, confidence=1.0, routing_reason="continued_pending_contact_task")
@@ -315,6 +332,9 @@ class AgentService:
         session = get_or_create_session(request.session_token, db)
         action = db.get(PendingEmailActionRow, request.action_id)
         if action is None:
+            generic_action = db.get(PendingAgentAction, request.action_id)
+            if generic_action is not None:
+                return await self._confirm_generic_action(session, generic_action, db)
             emit_event(db, "agent.confirmation_invalid", entity_type="pending_email_action", entity_id=request.action_id, payload={"status": "not_found"})
             db.commit()
             return self._invalid_confirmation("not_found")
@@ -348,8 +368,10 @@ class AgentService:
     async def cancel(self, request: AgentCancelRequest, db: Session) -> AgentChatResponse:
         session = get_or_create_session(request.session_token, db)
         cancel_pending_action(session.id, db)
+        cancel_generic_pending_actions(session.id, db)
         update_session(session.id, {"current_goal": None, "slots": {}, "active_contact_id": None, "context_summary": "User cancelled the pending agent action."}, db)
         emit_event(db, "agent.session_cancelled", entity_type="agent_session", entity_id=session.id)
+        emit_event(db, "agent.action_cancelled", entity_type="agent_session", entity_id=session.id)
         db.commit()
         return AgentChatResponse(response="Cancelled. I did not send anything.", source="System", intent="cancel", channel="action")
 
@@ -416,6 +438,221 @@ class AgentService:
             expires_at=action.expires_at,
         )
 
+    def _generic_pending_to_schema(self, action: PendingAgentAction) -> PendingEmailAction:
+        snapshot = self._json_field(action.action_snapshot_redacted, {})
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        return PendingEmailAction(
+            action_id=action.id,
+            capability=action.capability,
+            entity_type=action.entity_type,
+            entity_id=action.entity_id,
+            goal=str(snapshot.get("goal") or action.confirmation_prompt),
+            evidence_summary=str(snapshot.get("evidence_summary") or ""),
+            policy_result=str(snapshot.get("policy_result") or ""),
+            proposed_side_effect=str(snapshot.get("proposed_side_effect") or ""),
+            confirmation_prompt=action.confirmation_prompt,
+            expires_at=action.expires_at,
+        )
+
+    def _phase7_direct_response(self, message: str, session, contact_map: dict[str, str], turn_history: list[dict], db: Session) -> AgentChatResponse | None:
+        lowered = message.lower().strip()
+        if any(phrase in lowered for phrase in ("run any tool", "write anything", "change settings", "send any email", "send anything")):
+            raw_response = "That capability is too broad. I only support explicit, narrow actions with backend policy checks and confirmation."
+            formatted = format_for_layman(raw_response, contact_map)
+            self._save_turn_state(session, message, formatted, "action", "System", turn_history, db)
+            emit_event(db, "agent.capability_denied", entity_type="agent_session", entity_id=session.id, payload={"reason": "broad_capability_denied"})
+            return AgentChatResponse(response=formatted, source="System", intent="unsupported", channel="action", error_code="capability_denied")
+        if "deliverability" in lowered and any(word in lowered for word in ("summary", "health", "status", "read")):
+            return self._deliverability_summary_response(message, session, contact_map, turn_history, db)
+        if "workflow" in lowered and any(word in lowered for word in ("start", "run", "execute", "retry")):
+            return self._workflow_pending_response(message, session, contact_map, turn_history, db, retry_failed_only="retry" in lowered or "failed" in lowered)
+        if any(word in lowered for word in ("crm", "sheets", "hubspot", "salesforce", "integration")) and any(word in lowered for word in ("preview", "sync", "diff")):
+            return self._crm_preview_pending_response(message, session, contact_map, turn_history, db)
+        return None
+
+    def _deliverability_summary_response(self, message: str, session, contact_map: dict[str, str], turn_history: list[dict], db: Session) -> AgentChatResponse:
+        summary = deliverability_summary(db)
+        policy = summary.get("policy") if isinstance(summary, dict) else {}
+        reasons = policy.get("reasons") if isinstance(policy, dict) else []
+        if reasons:
+            health = "blocked by operational risk signals"
+            reason_text = ", ".join(str(reason) for reason in reasons[:6])
+        else:
+            health = "not currently blocked by the configured deliverability gates"
+            reason_text = "none"
+        raw_response = (
+            f"Deliverability health is {health}. Active block reasons: {reason_text}. "
+            "This is operational telemetry only; it is not guaranteed inbox placement and it does not bypass Gmail filtering."
+        )
+        formatted = format_for_layman(raw_response, contact_map)
+        self._save_turn_state(session, message, formatted, "task", "Deliverability", turn_history, db)
+        emit_event(db, "agent.private_read_answered", entity_type="agent_session", entity_id=session.id, payload={"capability": "deliverability_read_summary"})
+        return AgentChatResponse(response=formatted, source="Deliverability", intent="deliverability_read_summary", channel="task")
+
+    def _workflow_pending_response(
+        self,
+        message: str,
+        session,
+        contact_map: dict[str, str],
+        turn_history: list[dict],
+        db: Session,
+        *,
+        retry_failed_only: bool,
+    ) -> AgentChatResponse:
+        workbook = ensure_default_workbook(db)
+        allowed = workbook.status not in {"archived", "blocked", "deleted"}
+        capability = "workflow_retry_failed" if retry_failed_only else "workflow_run_start"
+        if not allowed:
+            raw_response = f"Workflow policy is currently blocked for {workbook.name}. I did not create a pending action."
+            formatted = format_for_layman(raw_response, contact_map)
+            self._save_turn_state(session, message, formatted, "action", "Workflows", turn_history, db)
+            emit_event(db, "agent.action_rejected", entity_type="workbook", entity_id=workbook.id, payload={"capability": capability, "status": "policy_now_blocked"})
+            return AgentChatResponse(response=formatted, source="Workflows", intent=capability, channel="action", error_code="policy_now_blocked")
+        row_count = db.query(WorkbookRow).filter(WorkbookRow.workbook_id == workbook.id).count()
+        column_count = db.query(WorkbookColumn).filter(WorkbookColumn.workbook_id == workbook.id).count()
+        params = {"workflow_id": workbook.id, "retry_failed_only": retry_failed_only}
+        action = create_generic_pending_action(
+            session.id,
+            capability=capability,
+            entity_type="workbook",
+            entity_id=workbook.id,
+            params=params,
+            source_label="Workflows",
+            goal=message,
+            evidence_summary=f"Workbook '{workbook.name}' has {row_count} rows and {column_count} configured steps.",
+            policy_result="Allowed now: local backend workflow run only; no email send and no external CRM or Sheets write.",
+            proposed_side_effect=f"{'Retry failed cells in' if retry_failed_only else 'Start'} the local workflow for workbook '{workbook.name}'.",
+            confirmation_prompt=f"{'Retry failed workflow cells' if retry_failed_only else 'Start workflow run'} for {workbook.name}?",
+            db=db,
+        )
+        pending = self._generic_pending_to_schema(action)
+        raw_response = "I prepared a workflow action for review. Use Confirm Action to run it, or Cancel to stop. I will not run it from chat text alone."
+        formatted = format_for_layman(raw_response, contact_map)
+        self._save_turn_state(session, message, formatted, "action", "Workflows", turn_history, db)
+        emit_event(db, "agent.action_proposed", entity_type="pending_agent_action", entity_id=action.id, payload={"capability": capability, "entity_type": "workbook", "entity_id": workbook.id})
+        return AgentChatResponse(response=formatted, source="Workflows", intent=capability, channel="action", is_clarification=True, pending_action=pending, error_code="confirmation_required")
+
+    def _crm_preview_pending_response(self, message: str, session, contact_map: dict[str, str], turn_history: list[dict], db: Session) -> AgentChatResponse:
+        contact = db.query(Contact).filter(Contact.deleted_at.is_(None)).order_by(Contact.created_at.asc()).first()
+        if not contact:
+            raw_response = "I need at least one contact before I can prepare a CRM or Sheets sync preview."
+            formatted = format_for_layman(raw_response, contact_map)
+            self._save_turn_state(session, message, formatted, "action", "Integrations", turn_history, db)
+            return AgentChatResponse(response=formatted, source="Integrations", intent="crm_preview_sync", channel="action", is_clarification=True, error_code="missing_slots")
+        provider = "google_sheets"
+        params = {"provider": provider, "contact_id": contact.id, "contact_email": contact.email}
+        action = create_generic_pending_action(
+            session.id,
+            capability="crm_preview_sync",
+            entity_type="contact",
+            entity_id=contact.id,
+            params=params,
+            source_label="Integrations",
+            goal=message,
+            evidence_summary=f"Selected contact {contact.email}. Preview will use backend mappings for {provider}.",
+            policy_result="Allowed now: create a local diff preview only; no external write.",
+            proposed_side_effect=f"Create a backend diff preview for {contact.email} in Google Sheets dry-run mode.",
+            confirmation_prompt=f"Create a Google Sheets sync preview for {contact.email}?",
+            db=db,
+        )
+        pending = self._generic_pending_to_schema(action)
+        raw_response = "I prepared an integration preview action for review. Confirm creates only a local diff preview; it will not write to Google Sheets or a CRM."
+        formatted = format_for_layman(raw_response, contact_map)
+        self._save_turn_state(session, message, formatted, "action", "Integrations", turn_history, db)
+        emit_event(db, "agent.action_proposed", entity_type="pending_agent_action", entity_id=action.id, payload={"capability": "crm_preview_sync", "entity_type": "contact", "entity_id": contact.id})
+        return AgentChatResponse(response=formatted, source="Integrations", intent="crm_preview_sync", channel="action", is_clarification=True, pending_action=pending, error_code="confirmation_required")
+
+    async def _confirm_generic_action(self, session, action: PendingAgentAction, db: Session) -> AgentChatResponse:
+        context = self._generic_validation_context(action, db)
+        status = validate_generic_pending_action(
+            action.id,
+            session.id,
+            capability=action.capability,
+            entity_type=context["entity_type"],
+            entity_id=context["entity_id"],
+            current_params=context["params"],
+            policy_allowed=bool(context["policy_allowed"]),
+            db=db,
+        )
+        if status != "valid":
+            emit_event(db, "agent.action_rejected", entity_type="pending_agent_action", entity_id=action.id, payload={"capability": action.capability, "status": status})
+            db.commit()
+            return self._invalid_generic_confirmation(action.capability, status)
+        claimed = claim_generic_pending_action(
+            action.id,
+            session.id,
+            capability=action.capability,
+            entity_type=context["entity_type"],
+            entity_id=context["entity_id"],
+            current_params=context["params"],
+            policy_allowed=bool(context["policy_allowed"]),
+            db=db,
+        )
+        if claimed != "valid":
+            emit_event(db, "agent.action_rejected", entity_type="pending_agent_action", entity_id=action.id, payload={"capability": action.capability, "status": claimed})
+            db.commit()
+            return self._invalid_generic_confirmation(action.capability, claimed)
+        emit_event(db, "agent.action_confirmed", entity_type="pending_agent_action", entity_id=action.id, payload={"capability": action.capability})
+        response = self._execute_generic_action(action, context, db)
+        emit_event(db, "agent.action_executed", entity_type=action.entity_type, entity_id=action.entity_id, payload={"capability": action.capability, "error_code": response.error_code})
+        db.commit()
+        return response
+
+    def _generic_validation_context(self, action: PendingAgentAction, db: Session) -> dict[str, Any]:
+        if action.capability in {"workflow_run_start", "workflow_retry_failed"}:
+            workbook = db.get(Workbook, action.entity_id or "")
+            if not workbook:
+                return {"entity_type": "workbook", "entity_id": None, "params": {}, "policy_allowed": False}
+            retry_failed_only = action.capability == "workflow_retry_failed"
+            return {
+                "entity_type": "workbook",
+                "entity_id": workbook.id,
+                "params": {"workflow_id": workbook.id, "retry_failed_only": retry_failed_only},
+                "policy_allowed": workbook.status not in {"archived", "blocked", "deleted"},
+            }
+        if action.capability == "crm_preview_sync":
+            snapshot = self._json_field(action.action_snapshot_redacted, {})
+            params = snapshot.get("params") if isinstance(snapshot, dict) else {}
+            provider = str(params.get("provider") or "google_sheets") if isinstance(params, dict) else "google_sheets"
+            contact = db.get(Contact, action.entity_id or "")
+            if not contact or contact.deleted_at is not None:
+                return {"entity_type": "contact", "entity_id": None, "params": {}, "policy_allowed": False}
+            return {
+                "entity_type": "contact",
+                "entity_id": contact.id,
+                "params": {"provider": provider, "contact_id": contact.id, "contact_email": contact.email},
+                "policy_allowed": True,
+            }
+        return {"entity_type": action.entity_type, "entity_id": None, "params": {}, "policy_allowed": False}
+
+    def _execute_generic_action(self, action: PendingAgentAction, context: dict[str, Any], db: Session) -> AgentChatResponse:
+        if action.capability in {"workflow_run_start", "workflow_retry_failed"}:
+            workbook = db.get(Workbook, context["entity_id"])
+            if not workbook:
+                return self._invalid_generic_confirmation(action.capability, "target_mismatch")
+            run = run_workflow(db, workbook, retry_failed_only=action.capability == "workflow_retry_failed")
+            payload = run_to_dict(run, db)
+            response = (
+                f"Confirmed. Workflow run {payload['id']} is {payload['status']} with {payload['total_cost_units']} cost units recorded. "
+                "This was a local backend workflow action; no email or external CRM/Sheets write was performed."
+            )
+            return AgentChatResponse(response=response, source="Workflows", intent=action.capability, channel="action")
+        if action.capability == "crm_preview_sync":
+            snapshot = self._json_field(action.action_snapshot_redacted, {})
+            params = snapshot.get("params") if isinstance(snapshot, dict) else {}
+            provider = str(params.get("provider") or "google_sheets") if isinstance(params, dict) else "google_sheets"
+            contact = db.get(Contact, context["entity_id"])
+            if not contact:
+                return self._invalid_generic_confirmation(action.capability, "target_mismatch")
+            preview = create_contact_sync_preview(db, provider, contact)
+            payload = preview_to_dict(preview)
+            response = (
+                f"Confirmed. Created {provider} diff preview {payload['id']} for {contact.email}. "
+                "No external write was performed; the preview still requires the Integrations confirmation flow."
+            )
+            return AgentChatResponse(response=response, source="Integrations", intent=action.capability, channel="action")
+        return AgentChatResponse(response="That confirmed action has no executor yet. I did not run it.", source="System", intent=action.capability, channel="action", error_code="capability_not_allowed")
+
     def _pending_ack_response(self, message: str, session, contact_map: dict[str, str], turn_history: list[dict], db: Session) -> AgentChatResponse | None:
         if message.strip().lower() not in {"ok", "okay", "yes", "yep", "sure", "go ahead", "looks good"}:
             return None
@@ -423,6 +660,37 @@ class AgentService:
         if not action_id:
             return None
         action = db.get(PendingEmailActionRow, action_id)
+        if not action:
+            generic_action = db.get(PendingAgentAction, action_id)
+            if not generic_action or generic_action.consumed:
+                return None
+            context = self._generic_validation_context(generic_action, db)
+            status = validate_generic_pending_action(
+                generic_action.id,
+                session.id,
+                capability=generic_action.capability,
+                entity_type=context["entity_type"],
+                entity_id=context["entity_id"],
+                current_params=context["params"],
+                policy_allowed=bool(context["policy_allowed"]),
+                db=db,
+            )
+            if status != "valid":
+                response = self._invalid_generic_confirmation(generic_action.capability, status)
+                self._save_turn_state(session, message, response.response, "action", "System", turn_history, db)
+                return response
+            raw_response = "That action is waiting for button confirmation. Use Confirm Action to proceed or Cancel to stop. I will not execute it from a chat acknowledgement."
+            formatted = format_for_layman(raw_response, contact_map)
+            self._save_turn_state(session, message, formatted, "action", "System", turn_history, db)
+            return AgentChatResponse(
+                response=formatted,
+                source="System",
+                intent=generic_action.capability,
+                channel="action",
+                is_clarification=True,
+                pending_action=self._generic_pending_to_schema(generic_action),
+                error_code="confirmation_required",
+            )
         if not action or action.consumed:
             return None
         status = validate_pending_action(action.id, session.id, action.draft_id, db)
@@ -795,6 +1063,25 @@ class AgentService:
             "hash_mismatch": "The draft changed after confirmation was created. Please review it again before sending.",
         }
         return AgentChatResponse(response=messages.get(status, "That confirmation is not valid. I did not send anything."), source="System", intent="email_send_draft", channel="action", error_code=status)
+
+    def _invalid_generic_confirmation(self, capability: str, status: str) -> AgentChatResponse:
+        messages = {
+            "not_found": "confirmation_required: I could not find that pending action. I did not run anything.",
+            "expired": "That confirmation expired. I did not run the action.",
+            "consumed": "That action was already confirmed or cancelled. I will not run it again.",
+            "session_mismatch": "That confirmation belongs to a different assistant session. I did not run anything.",
+            "target_mismatch": "That action no longer matches the target record. I did not run anything.",
+            "hash_mismatch": "That action changed after confirmation was created. Please review it again before running.",
+            "policy_now_blocked": "Policy now blocks that action. I did not run anything.",
+            "capability_not_allowed": "That capability is not allowed for generic confirmation. I did not run anything.",
+        }
+        return AgentChatResponse(
+            response=messages.get(status, "That confirmation is not valid. I did not run anything."),
+            source="System",
+            intent=capability,
+            channel="action",
+            error_code=status,
+        )
 
     def _contact_map(self, session, db: Session) -> dict[str, str]:
         existing = self._json_field(getattr(session, "contact_name_map", None), {})

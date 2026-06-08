@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.agent.pending import claim_generic_pending_action
 from app.ai.gateway import GROQ_MODEL_DEFAULT
 from app.ai.gemini_pool import GEMINI_MODEL_DEFAULT
 from app.ai.prompts import DEFAULT_SENDER_SIGNATURE, sender_profile_from_settings
@@ -19,7 +20,20 @@ from app.core.idempotency import sha256_key
 from app.core.time import iso, utcnow
 from app.db.models import Contact, ConversationMessage, Draft, Reply, SendAttempt, Suppression
 from app.db.session import get_db
+from app.deliverability.service import deliverability_policy
+from app.send.policy import prequeue_block_reasons
+from app.send.outcomes import simulated_outcome
+from app.send.governance import (
+    begin_provider_attempt,
+    governed_action_to_dict,
+    persist_provider_outcome,
+    persist_provider_outcome_as_reconciliation,
+    prepare_governed_action,
+    provider_attempt_stop_fence_changed,
+)
+from app.send.sequence import provider_acceptance_evidence_present
 from app.send.smtp_adapter import GmailAdapter
+from app.send.truth import attempt_from_outcome, outcome_audit_payload
 from app.settings.service import get_bool, get_effective_daily_send_cap, get_int, get_key_list, get_secret, get_value, sender_credentials_configured
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
@@ -80,8 +94,13 @@ class ConversationGenerate(BaseModel):
 
 
 class ConversationSend(BaseModel):
+    session_token: str
     subject: str
     body: str
+
+
+class ConversationConfirm(ConversationSend):
+    action_id: str
 
 
 def message_to_dict(row: ConversationMessage) -> dict:
@@ -102,12 +121,23 @@ def message_to_dict(row: ConversationMessage) -> dict:
 def contact_summary(db: Session, contact: Contact) -> dict:
     last = (
         db.query(ConversationMessage)
-        .filter(ConversationMessage.contact_id == contact.id)
+        .filter(
+            ConversationMessage.contact_id == contact.id,
+            ConversationMessage.source != "auto_reply_proposed",
+        )
         .order_by(ConversationMessage.occurred_at.desc())
         .first()
     )
     inbound = db.query(ConversationMessage).filter(ConversationMessage.contact_id == contact.id, ConversationMessage.direction == "inbound").count()
-    outbound = db.query(ConversationMessage).filter(ConversationMessage.contact_id == contact.id, ConversationMessage.direction == "outbound").count()
+    outbound = (
+        db.query(ConversationMessage)
+        .filter(
+            ConversationMessage.contact_id == contact.id,
+            ConversationMessage.direction == "outbound",
+            ConversationMessage.source != "auto_reply_proposed",
+        )
+        .count()
+    )
     return {
         "contact_id": contact.id,
         "email": contact.email,
@@ -130,12 +160,16 @@ def _backfill_contact_conversation(db: Session, contact: Contact) -> None:
     changed = False
     attempts = (
         db.query(SendAttempt)
-        .filter(SendAttempt.contact_id == contact.id, SendAttempt.status == "success")
+        .filter(SendAttempt.contact_id == contact.id, SendAttempt.provider_accepted.is_(True))
         .order_by(SendAttempt.sent_at.asc())
         .all()
     )
     for attempt in attempts:
-        external_message_id = attempt.provider_msg_id or f"attempt:{attempt.id}"
+        if not provider_acceptance_evidence_present(attempt):
+            continue
+        external_message_id = attempt.provider_msg_id or attempt.tracking_message_id
+        if not external_message_id:
+            continue
         if _has_conversation_message(db, external_message_id):
             continue
         draft = db.get(Draft, attempt.draft_id) if attempt.draft_id and attempt.draft_id != "conversation" else None
@@ -176,9 +210,6 @@ def _backfill_contact_conversation(db: Session, contact: Contact) -> None:
 @router.get("")
 def list_conversations(db: Session = Depends(get_db)):
     contacts = db.query(Contact).filter(Contact.deleted_at.is_(None)).order_by(Contact.updated_at.desc()).all()
-    for contact in contacts:
-        _backfill_contact_conversation(db, contact)
-    db.commit()
     return {"items": [contact_summary(db, contact) for contact in contacts], "total": len(contacts)}
 
 
@@ -187,8 +218,6 @@ def get_conversation(contact_id: str, db: Session = Depends(get_db)):
     contact = db.get(Contact, contact_id)
     if not contact or contact.deleted_at is not None:
         raise HTTPException(status_code=404, detail="contact not found")
-    _backfill_contact_conversation(db, contact)
-    db.commit()
     messages = (
         db.query(ConversationMessage)
         .filter(ConversationMessage.contact_id == contact.id)
@@ -221,94 +250,262 @@ async def generate_conversation_reply(contact_id: str, payload: ConversationGene
     return result
 
 
-@router.post("/{contact_id}/send")
-async def send_conversation_reply(contact_id: str, payload: ConversationSend, db: Session = Depends(get_db)):
+@router.post("/{contact_id}/send", status_code=202)
+def send_conversation_reply(contact_id: str, payload: ConversationSend, db: Session = Depends(get_db)):
     contact = db.get(Contact, contact_id)
     if not contact:
         raise HTTPException(status_code=404, detail="contact not found")
     if not get_bool(db, "canary_verified"):
         raise HTTPException(status_code=409, detail="sender not canary verified")
-    user = get_value(db, "gmail_user")
-    password = get_secret(db, "gmail_app_password")
     if not sender_credentials_configured(db):
         raise HTTPException(status_code=409, detail="sender not configured")
     block_reasons = _engaged_send_block_reasons(db, contact)
     if block_reasons:
         raise HTTPException(status_code=409, detail={"blocked": block_reasons})
+    params = {
+        "contact_id": contact.id,
+        "to": contact.email,
+        "subject": payload.subject,
+        "body": payload.body,
+        "stop_generation": contact.send_stop_generation,
+    }
+    action = prepare_governed_action(
+        db,
+        session_token=payload.session_token,
+        capability="conversation_send_reply",
+        entity_type="contact",
+        entity_id=contact.id,
+        params=params,
+        source_label="Conversations",
+        goal="Send the reviewed conversation reply",
+        evidence_summary="Recipient, subject, body, and current send policy were reviewed.",
+        policy_result="allowed",
+        proposed_side_effect=f"Send one email reply to {contact.email}.",
+        confirmation_prompt=f'Send this reply to {contact.email} with subject "{payload.subject}"?',
+    )
+    emit_event(
+        db,
+        "conversation.confirmation_created",
+        entity_type="pending_agent_action",
+        entity_id=action.id,
+        payload={"contact_id": contact.id, "capability": action.capability},
+    )
+    db.commit()
+    return {"status": "pending_confirmation", "pending_action": governed_action_to_dict(action)}
 
-    sent_at = utcnow()
-    idempotency_key = sha256_key("conversation", contact.id, sent_at.isoformat(), payload.subject, payload.body)
+
+@router.post("/{contact_id}/confirm-send")
+async def confirm_conversation_reply(contact_id: str, payload: ConversationConfirm, db: Session = Depends(get_db)):
+    contact = db.get(Contact, contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="contact not found")
+    params = {
+        "contact_id": contact.id,
+        "to": contact.email,
+        "subject": payload.subject,
+        "body": payload.body,
+        "stop_generation": contact.send_stop_generation,
+    }
+    block_reasons = _engaged_send_block_reasons(db, contact)
+    status = claim_generic_pending_action(
+        payload.action_id,
+        payload.session_token,
+        capability="conversation_send_reply",
+        entity_type="contact",
+        entity_id=contact.id,
+        current_params=params,
+        policy_allowed=not block_reasons,
+        db=db,
+    )
+    if status != "valid":
+        emit_event(
+            db,
+            "conversation.confirmation_rejected",
+            entity_type="pending_agent_action",
+            entity_id=payload.action_id,
+            payload={"contact_id": contact.id, "status": status},
+        )
+        db.commit()
+        raise HTTPException(status_code=409, detail=status)
+    db.commit()
+    return await _execute_conversation_send(db, contact, payload.subject, payload.body)
+
+
+async def _execute_conversation_send(db: Session, contact: Contact, subject: str, body: str) -> dict:
+    user = get_value(db, "gmail_user")
+    password = get_secret(db, "gmail_app_password")
+    block_reasons = _engaged_send_block_reasons(db, contact)
+    if block_reasons:
+        raise HTTPException(status_code=409, detail={"blocked": block_reasons})
+    idempotency_key = sha256_key("conversation", contact.id, subject, body)
+    existing = (
+        db.query(SendAttempt)
+        .filter(SendAttempt.idempotency_key == idempotency_key, SendAttempt.provider_accepted.is_(True))
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="consumed")
     if get_bool(db, "dry_run"):
-        attempt = SendAttempt(
+        adapter = GmailAdapter.from_settings(db)
+        outcome = simulated_outcome(
+            adapter.resolution,
+            error_code="dry_run",
+            detail="Dry-run mode simulated the governed conversation send; no provider was contacted",
+        ).with_context(idempotency_key=idempotency_key)
+        attempt = attempt_from_outcome(
+            outcome,
             queue_id="conversation",
             contact_id=contact.id,
             draft_id="conversation",
             idempotency_key=idempotency_key,
-            status="blocked_dry_run",
             sender_identity=user,
-            error_code="dry_run",
-            error_detail="Dry run mode prevented SMTP send",
         )
         db.add(attempt)
+        db.flush()
+        outcome = outcome.with_context(attempt_id=attempt.id)
+        emit_event(db, "conversation.simulated", entity_type="contact", entity_id=contact.id, payload=outcome_audit_payload(outcome))
         db.commit()
-        return {"status": "skipped", "error_code": "dry_run"}
+        return outcome.to_dict()
 
-    result = await GmailAdapter.from_settings(db).send_message(contact.email, payload.subject, payload.body, user, password)
-    if result.status != "success":
-        db.add(
-            SendAttempt(
-                queue_id="conversation",
-                contact_id=contact.id,
-                draft_id="conversation",
-                idempotency_key=idempotency_key,
-                status="failed",
-                sender_identity=user,
-                error_code=result.error_code,
-                error_detail=result.error_detail,
-            )
-        )
-        emit_event(db, "send.failed", entity_type="contact", entity_id=contact.id, payload={"error_code": result.error_code})
-        db.commit()
-        return {"status": "failed", "error_code": result.error_code}
-
-    db.add(
-        SendAttempt(
-            queue_id="conversation",
-            contact_id=contact.id,
-            draft_id="conversation",
-            idempotency_key=idempotency_key,
-            provider_msg_id=result.provider_msg_id,
-            smtp_response=result.smtp_response,
-            status="success",
-            sender_identity=user,
-            sent_at=sent_at,
-        )
-    )
-    message = ConversationMessage(
+    adapter = GmailAdapter.from_settings(db)
+    attempt, attempt_state = begin_provider_attempt(
+        db,
+        queue_id="conversation",
         contact_id=contact.id,
-        direction="outbound",
-        subject=payload.subject,
-        body=payload.body,
-        source="conversation",
-        external_message_id=result.provider_msg_id,
-        occurred_at=sent_at,
+        draft_id="conversation",
+        idempotency_key=idempotency_key,
+        sender_identity=user,
+        configured_transport=adapter.resolution.configured_transport,
+        effective_transport=adapter.resolution.effective_transport,
+        transport_source=adapter.resolution.transport_source,
+        entity_type="contact",
+        entity_id=contact.id,
+        audit_source="conversation",
     )
-    db.add(message)
-    contact.status = "conversation_active"
-    emit_event(db, "conversation.sent", entity_type="contact", entity_id=contact.id, payload={"message_id": result.provider_msg_id})
-    emit_event(db, "send.success", entity_type="contact", entity_id=contact.id)
-    db.commit()
-    return {"status": "success", "message": message_to_dict(message), "provider_msg_id": result.provider_msg_id}
+    if attempt_state == "provider_accepted":
+        raise HTTPException(status_code=409, detail="consumed")
+    if attempt_state == "reconciliation_required":
+        raise HTTPException(status_code=409, detail="reconciliation_required")
+
+    db.expire_all()
+    contact = db.get(Contact, contact.id)
+    block_reasons = _engaged_send_block_reasons(db, contact)
+    if provider_attempt_stop_fence_changed(db, attempt.id):
+        block_reasons.append("CONTACT_SEND_STOPPED")
+    if block_reasons:
+        outcome = simulated_outcome(
+            adapter.resolution,
+            error_code="policy_changed_before_provider_call",
+            detail="Policy changed after confirmation; provider execution was blocked",
+            blocked=True,
+        ).with_context(idempotency_key=idempotency_key, attempt_id=attempt.id)
+        persist_provider_outcome(
+            db,
+            attempt_id=attempt.id,
+            outcome=outcome,
+            entity_type="contact",
+            entity_id=contact.id,
+            audit_source="conversation",
+        )
+        emit_event(
+            db,
+            "conversation.send_not_accepted",
+            entity_type="contact",
+            entity_id=contact.id,
+            payload={**outcome_audit_payload(outcome), "reasons": block_reasons},
+        )
+        db.commit()
+        return outcome.to_dict()
+
+    sent_at = utcnow()
+    outcome = (
+        await adapter.send_message(contact.email, subject, body, user, password)
+    ).with_context(idempotency_key=idempotency_key, attempt_id=attempt.id)
+    db.expire_all()
+    if outcome.provider_accepted and provider_attempt_stop_fence_changed(db, attempt.id):
+        persist_provider_outcome_as_reconciliation(
+            db,
+            attempt_id=attempt.id,
+            outcome=outcome,
+            entity_type="contact",
+            entity_id=contact.id,
+            audit_source="conversation",
+            error_code="contact_stopped_after_provider_call",
+            error_detail="Contact send authority changed while the provider call was in flight",
+        )
+        return {
+            **outcome.to_dict(),
+            "status": "reconciliation_required",
+            "attempt_status": "reconciliation_required",
+            "error_code": "contact_stopped_after_provider_call",
+        }
+    projected: dict[str, ConversationMessage] = {}
+
+    def project_conversation(session: Session, _attempt: SendAttempt) -> None:
+        if not outcome.provider_accepted:
+            emit_event(
+                session,
+                "conversation.send_not_accepted",
+                entity_type="contact",
+                entity_id=contact.id,
+                payload=outcome_audit_payload(outcome),
+            )
+            return
+        message = ConversationMessage(
+            contact_id=contact.id,
+            direction="outbound",
+            subject=subject,
+            body=body,
+            source="conversation",
+            external_message_id=outcome.provider_message_id or outcome.tracking_message_id,
+            occurred_at=sent_at,
+        )
+        session.add(message)
+        contact.status = "conversation_active"
+        emit_event(session, "conversation.sent", entity_type="contact", entity_id=contact.id, payload=outcome_audit_payload(outcome))
+        emit_event(session, "send.success", entity_type="contact", entity_id=contact.id, payload=outcome_audit_payload(outcome))
+        projected["message"] = message
+
+    attempt, persisted = persist_provider_outcome(
+        db,
+        attempt_id=attempt.id,
+        outcome=outcome,
+        entity_type="contact",
+        entity_id=contact.id,
+        audit_source="conversation",
+        project=project_conversation,
+    )
+    if not persisted:
+        return {
+            **outcome.to_dict(),
+            "status": "reconciliation_required",
+            "attempt_status": "reconciliation_required",
+            "error_code": "post_provider_commit_failed",
+        }
+    if not outcome.provider_accepted:
+        return outcome.to_dict()
+
+    message = projected["message"]
+    return {
+        **outcome.to_dict(),
+        "status": "provider_accepted",
+        "message": message_to_dict(message),
+        "provider_msg_id": outcome.provider_message_id,
+    }
 
 
 def _engaged_send_block_reasons(db: Session, contact: Contact) -> list[str]:
     now = utcnow()
     one_day = now - timedelta(days=1)
     one_hour = now - timedelta(hours=1)
-    success_attempts = db.query(SendAttempt).filter(SendAttempt.status == "success")
+    success_attempts = db.query(SendAttempt).filter(SendAttempt.provider_accepted.is_(True))
     sent_today = success_attempts.filter(SendAttempt.sent_at >= one_day).count()
     sent_hour = success_attempts.filter(SendAttempt.sent_at >= one_hour).count()
     reasons: list[str] = []
+    if not sender_credentials_configured(db):
+        reasons.append("SENDER_NOT_CONFIGURED")
+    if not get_bool(db, "canary_verified"):
+        reasons.append("CANARY_NOT_VERIFIED")
     if contact.deleted_at is not None:
         reasons.append("CONTACT_DELETED")
     suppression = db.query(Suppression).filter(Suppression.email == contact.email).first()
@@ -331,6 +528,8 @@ def _engaged_send_block_reasons(db: Session, contact: Contact) -> list[str]:
         reasons.append("HOURLY_CAP_EXCEEDED")
     if not send_window_open(db, now):
         reasons.append("SEND_WINDOW_CLOSED")
+    reasons.extend(prequeue_block_reasons(contact, db))
+    reasons.extend(deliverability_policy(db, contact)["reasons"])
     return reasons
 
 

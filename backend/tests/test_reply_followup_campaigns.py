@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from app.db.models import Contact, ConversationMessage, Draft, FollowUpSequence, Reply, SendAttempt, SendQueue, Suppression
 from app.db.session import SessionLocal
@@ -27,12 +28,34 @@ def _make_draft(client, contact_id: str):
     ).json()
 
 
+def _queue_approved_draft_without_sending(
+    client,
+    contact_id: str,
+    draft_id: str,
+    *,
+    sequence_num: int = 1,
+    followup_id: str | None = None,
+):
+    with SessionLocal() as db:
+        draft = db.get(Draft, draft_id)
+        draft.approved = True
+        draft.approved_at = datetime.now(timezone.utc)
+        if followup_id:
+            followup = db.get(FollowUpSequence, followup_id)
+            followup.status = "queued"
+            followup.draft_id = draft_id
+        db.commit()
+    return client.post(
+        "/api/queue",
+        json={"contact_id": contact_id, "draft_id": draft_id, "sequence_num": sequence_num},
+    ).json()
+
+
 def _make_due_followup(client):
     configure_sender(client, canary_verified=True, dry_run=False)
     contact = _make_contact(client, "followup-growth@example.com")
     draft = _make_draft(client, contact["id"])
     client.post(f"/api/drafts/{draft['id']}/approve")
-    client.post("/api/queue/process")
     sequence = client.get("/api/followups").json()["items"][0]
     past_due = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     client.patch(f"/api/followups/{sequence['id']}", json={"due_at": past_due})
@@ -237,6 +260,115 @@ def test_same_external_message_id_dedupes_within_contact(client):
     assert message_count == 1
 
 
+def test_reply_dedupe_key_is_database_enforced(client):
+    contact = _make_contact(client, "dedupe-database@example.com")
+    with SessionLocal() as db:
+        first = Reply(
+            contact_id=contact["id"],
+            received_at=datetime.now(timezone.utc),
+            classified_as="reply",
+            intent="question",
+            external_message_id="<dedupe-database@example.com>",
+            dedupe_key="phase13-dedupe-key",
+        )
+        db.add(first)
+        db.commit()
+
+    with SessionLocal() as db:
+        db.add(
+            Reply(
+                contact_id=contact["id"],
+                received_at=datetime.now(timezone.utc),
+                classified_as="reply",
+                intent="question",
+                external_message_id="<dedupe-database@example.com>",
+                dedupe_key="phase13-dedupe-key",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db.commit()
+
+
+def test_historical_null_dedupe_key_is_normalized_without_duplicate_stop(client):
+    contact = _make_contact(client, "legacy-dedupe@example.com")
+    with SessionLocal() as db:
+        db.add(
+            Reply(
+                contact_id=contact["id"],
+                received_at=datetime.now(timezone.utc),
+                classified_as="reply",
+                intent="question",
+                external_message_id="<LEGACY-REPLY@EXAMPLE.COM>",
+                dedupe_key=None,
+            )
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        row, created = create_reply_record(
+            db,
+            db.get(Contact, contact["id"]),
+            "reply",
+            "Normalized replay of a historical provider message.",
+            external_message_id=" <legacy-reply@example.com> ",
+            stop_followups=True,
+            intent="question",
+        )
+        db.commit()
+        assert created is False
+        assert row.dedupe_key
+        assert db.query(Reply).filter_by(contact_id=contact["id"]).count() == 1
+        assert db.get(Contact, contact["id"]).send_stop_generation == 0
+
+
+def test_mixed_historical_duplicate_replay_prefers_existing_key(client):
+    contact = _make_contact(client, "mixed-legacy-dedupe@example.com")
+    normalized_message_id = "<mixed-legacy@example.com>"
+    from app.core.idempotency import sha256_key
+
+    dedupe_key = sha256_key("reply", contact["id"], normalized_message_id)
+    with SessionLocal() as db:
+        db.add_all(
+            [
+                Reply(
+                    id="legacy-null-reply",
+                    contact_id=contact["id"],
+                    received_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+                    classified_as="reply",
+                    intent="question",
+                    external_message_id="<MIXED-LEGACY@EXAMPLE.COM>",
+                    dedupe_key=None,
+                ),
+                Reply(
+                    id="legacy-keyed-reply",
+                    contact_id=contact["id"],
+                    received_at=datetime.now(timezone.utc),
+                    classified_as="reply",
+                    intent="question",
+                    external_message_id=normalized_message_id,
+                    dedupe_key=dedupe_key,
+                ),
+            ]
+        )
+        db.commit()
+
+    with SessionLocal() as db:
+        row, created = create_reply_record(
+            db,
+            db.get(Contact, contact["id"]),
+            "reply",
+            "Replay should resolve to the canonical keyed historical row.",
+            external_message_id=" <mixed-legacy@example.com> ",
+            stop_followups=True,
+            intent="question",
+        )
+        db.commit()
+        assert created is False
+        assert row.id == "legacy-keyed-reply"
+        assert db.query(Reply).filter_by(contact_id=contact["id"]).count() == 2
+        assert db.get(Contact, contact["id"]).send_stop_generation == 0
+
+
 def test_thread_header_contact_mapping_prefers_message_id_contact(client):
     sender_contact = _make_contact(client, "shared-sender@example.com")
     target_contact = _make_contact(client, "thread-target@example.com")
@@ -247,8 +379,16 @@ def test_thread_header_contact_mapping_prefers_message_id_contact(client):
                 queue_id="queue-thread-target",
                 contact_id=target_contact["id"],
                 draft_id="draft-thread-target",
-                provider_msg_id="<sent-target@example.com>",
-                status="success",
+                provider_msg_id="18f4a8c2d3145678",
+                tracking_message_id="<sent-target@example.com>",
+                status="provider_accepted",
+                configured_transport="gmail_api",
+                effective_transport="gmail_api",
+                transport_source="test_fixture",
+                simulated=False,
+                provider_contacted=True,
+                provider_accepted=True,
+                provider_response_classification="gmail_api_accepted",
                 sender_identity="primary@example.com",
                 sent_at=datetime.now(timezone.utc),
             )
@@ -282,7 +422,9 @@ def test_positive_interest_escalates_contact_to_conversation_active(client):
 
 
 def test_suppression_can_be_removed_from_api(client):
-    created = client.post("/api/suppressions", json={"email": "remove-suppression@example.com", "reason": "manual", "source": "ui"}).json()
+    contact = _make_contact(client, "remove-suppression@example.com")
+    created = client.post("/api/suppressions", json={"email": contact["email"], "reason": "manual", "source": "ui"}).json()
+    assert client.get("/api/contacts").json()["items"][0]["status"] == "suppressed"
 
     response = client.delete(f"/api/suppressions/{created['id']}")
 
@@ -290,6 +432,7 @@ def test_suppression_can_be_removed_from_api(client):
     assert response.json()["deleted"] is True
     suppressions = client.get("/api/suppressions").json()["items"]
     assert not any(row["email"] == "remove-suppression@example.com" for row in suppressions)
+    assert client.get("/api/contacts").json()["items"][0]["status"] == "imported"
     event_types = [row["event_type"] for row in client.get("/api/audit").json()["items"]]
     assert "suppression.removed" in event_types
 
@@ -390,17 +533,30 @@ def test_followup_approve_draft_endpoint_sends_immediately_and_schedules_next(cl
 
     assert result.status_code == 200
     assert result.json()["status"] == "queued"
-    assert result.json()["delivery_status"] == "sent"
-    assert updated["status"] == "dispatched"
+    assert result.json()["delivery_status"] == "provider_accepted"
+    assert updated["status"] == "provider_accepted"
     with SessionLocal() as db:
         draft = db.get(Draft, pending["pending_draft_id"])
         queue = db.get(SendQueue, result.json()["queue_id"])
         next_sequence = db.query(FollowUpSequence).filter_by(contact_id=contact["id"], sequence_num=3).first()
         assert draft.approved is True
         assert queue.draft_id == draft.id
-        assert queue.status == "sent"
+        assert queue.status == "provider_accepted"
         assert next_sequence is not None
     assert len(client.app.state.transport.sent) == 2
+
+
+def test_followup_approve_draft_endpoint_queues(client):
+    _contact, sequence = _make_due_followup(client)
+    client.post("/api/followups/process")
+
+    result = client.post(f"/api/followups/{sequence['id']}/approve-draft")
+
+    assert result.status_code == 200
+    assert result.json()["status"] == "queued"
+    assert result.json()["queue_id"]
+    assert result.json()["queue"]["status"] == "provider_accepted"
+    assert result.json()["queue"]["latest_attempt"]["provider_accepted"] is True
 
 
 def test_followup_approval_dry_run_blocks_without_queueing(client):
@@ -484,6 +640,101 @@ def test_campaign_patch_updates_step_cards(client):
     assert response.status_code == 200
     assert response.json()["step_1_draft"]["subject"] == "Edited"
     assert response.json()["status"] == "paused"
+
+
+def test_pausing_campaign_invalidates_queued_draft_and_blocks_send(client, monkeypatch):
+    configure_sender(client, canary_verified=True, dry_run=False)
+    contact = _make_contact(client, "campaign-pause@example.com", tags="phase14")
+    monkeypatch.setattr(
+        "app.campaigns.router._call_groq_campaign",
+        lambda db, key, prompt: json.dumps(
+            {
+                "step_1": {"subject": "Reviewed campaign", "body": "Reviewed campaign body.", "purpose": "initial outreach"},
+                "step_2": {"subject": "Follow", "body": "Value", "purpose": "value-add follow-up"},
+                "step_3": {"subject": "Close", "body": "Breakup", "purpose": "polite breakup email"},
+            }
+        ),
+    )
+    campaign = client.post(
+        "/api/campaigns",
+        json={"name": "Pause Guard", "goal": "Guard sends", "target_tags": "phase14"},
+    ).json()
+    assert client.post(f"/api/campaigns/{campaign['id']}/activate").status_code == 200
+    draft = next(row for row in client.get("/api/drafts").json()["items"] if row["contact_id"] == contact["id"])
+    queued = _queue_approved_draft_without_sending(client, contact["id"], draft["id"])
+
+    paused = client.patch(f"/api/campaigns/{campaign['id']}", json={"status": "paused"})
+    processed = client.post("/api/queue/process").json()
+
+    assert paused.status_code == 200
+    assert processed["provider_accepted"] == 0
+    assert len(client.app.state.transport.sent) == 0
+    with SessionLocal() as db:
+        assert db.get(Draft, draft["id"]).approved is False
+        assert db.get(SendQueue, queued["id"]).status == "cancelled"
+
+
+def test_pausing_campaign_stops_already_scheduled_followup(client, monkeypatch):
+    configure_sender(client, canary_verified=True, dry_run=False)
+    contact = _make_contact(client, "campaign-followup-pause@recipient.test", tags="phase14-followup")
+    monkeypatch.setattr(
+        "app.campaigns.router._call_groq_campaign",
+        lambda db, key, prompt: json.dumps(
+            {
+                "step_1": {"subject": "Campaign initial", "body": "Campaign initial body.", "purpose": "initial outreach"},
+                "step_2": {"subject": "Campaign follow", "body": "Campaign value.", "purpose": "value-add follow-up"},
+                "step_3": {"subject": "Campaign close", "body": "Campaign close.", "purpose": "polite breakup email"},
+            }
+        ),
+    )
+    campaign = client.post(
+        "/api/campaigns",
+        json={"name": "Pause Scheduled Followup", "goal": "Stop later work", "target_tags": "phase14-followup"},
+    ).json()
+    assert client.post(f"/api/campaigns/{campaign['id']}/activate").status_code == 200
+    draft = next(row for row in client.get("/api/drafts").json()["items"] if row["contact_id"] == contact["id"])
+    initial_approval = client.post(f"/api/drafts/{draft['id']}/approve")
+    assert initial_approval.status_code == 200
+    assert initial_approval.json()["delivery_status"] == "provider_accepted"
+    followup = client.get("/api/followups").json()["items"][0]
+    past_due = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    assert client.patch(f"/api/followups/{followup['id']}", json={"due_at": past_due}).status_code == 200
+    assert client.post("/api/followups/process").status_code == 200
+    pending_followup = client.get(f"/api/followups/{followup['id']}").json()
+    queued_followup = _queue_approved_draft_without_sending(
+        client,
+        contact["id"],
+        pending_followup["pending_draft_id"],
+        sequence_num=2,
+        followup_id=followup["id"],
+    )
+    followup_queue_id = queued_followup["id"]
+
+    paused = client.patch(f"/api/campaigns/{campaign['id']}", json={"status": "paused"})
+    processed = client.post("/api/queue/process").json()
+
+    assert paused.status_code == 200
+    assert processed["provider_accepted"] == 0
+    assert len(client.app.state.transport.sent) == 1
+    with SessionLocal() as db:
+        followup = db.query(FollowUpSequence).filter_by(contact_id=contact["id"], sequence_num=2).one()
+        assert followup.status == "stopped"
+        assert followup.stop_reason == "CAMPAIGN_NOT_ACTIVE"
+        assert db.get(SendQueue, followup_queue_id).status == "cancelled"
+        assert db.get(Draft, followup.pending_draft_id).approved is False
+
+
+def test_blank_campaign_step_cannot_activate(client):
+    campaign = client.post(
+        "/api/campaigns",
+        json={"name": "Incomplete", "goal": "No configured AI", "target_tags": ""},
+    ).json()
+
+    response = client.post(f"/api/campaigns/{campaign['id']}/activate")
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "campaign_step_1_incomplete"
+    assert client.get("/api/drafts").json()["total"] == 0
 
 
 def test_campaign_activate_assigns_unapproved_drafts_to_tagged_contacts(client, monkeypatch):
